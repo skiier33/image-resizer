@@ -2,16 +2,48 @@
 
 from __future__ import annotations
 
+import base64
+import colorsys
+import dataclasses
+import io
 import json
 import math
+import os
+import queue
+import random
+import threading
 import tkinter as tk
+import urllib.error
+import urllib.request
 import uuid
+import zipfile
 from dataclasses import dataclass, field, replace
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 from pathlib import Path
 from typing import Callable, Literal, Optional, Union
 
-from PIL import Image, ImageChops, ImageDraw, ImageTk
+from PIL import Image, ImageChops, ImageColor, ImageDraw, ImageFilter, ImageTk
+from board_core.common import (
+    EDGE_SHAPES,
+    EdgeSide,
+    MaskShape,
+    clamp,
+)
+from board_core.masks import (
+    apply_shape_mask,
+    create_shape_mask,
+)
+from board_core.layout import (
+    COLLAGE_DEFAULT_CORNER_PCT,
+    COLLAGE_DEFAULT_OVERLAP_PCT,
+    COLLAGE_MAX_CORNER_PCT,
+    COLLAGE_MAX_STROKE,
+    CollageItemOptions,
+    aspect_locked_corner_rect,
+    compute_arrangement,
+    compute_collage,
+    compute_shelf_layout,
+)
 
 SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".tif"}
 HANDLE_RADIUS = 6
@@ -64,6 +96,25 @@ THEME_PALETTES: dict[str, dict[str, str]] = {
     },
 }
 
+def load_dotenv(path: Path) -> None:
+    """Load KEY=VALUE lines from a .env file into os.environ. Real environment variables win."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip().removeprefix("export ").strip()
+        value = value.strip().strip("\"'")
+        if key and value:
+            os.environ.setdefault(key, value)
+
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 SETTINGS_PATH = Path.home() / ".image_resizer_settings.json"
 
 
@@ -74,6 +125,25 @@ def load_settings() -> dict[str, object]:
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+# Page used for a new board and at startup: US Letter at 150 DPI, landscape, unless the user set another.
+BUILTIN_DEFAULT_PAGE: tuple[int, int, str] = (1650, 1275, "#ffffff")
+
+
+def load_default_page() -> tuple[int, int, str]:
+    """The default page (width, height, background) saved with Set as default page, or the built-in one."""
+    saved = load_settings().get("default_page")
+    if not isinstance(saved, dict):
+        return BUILTIN_DEFAULT_PAGE
+    width, height, bg = saved.get("width"), saved.get("height"), saved.get("bg")
+    valid_size = all(
+        isinstance(v, int) and not isinstance(v, bool) and MIN_PAGE_SIZE <= v <= MAX_PAGE_SIZE
+        for v in (width, height)
+    )
+    if valid_size and isinstance(bg, str) and _is_hex_color(bg):
+        return int(width), int(height), bg  # type: ignore[arg-type]
+    return BUILTIN_DEFAULT_PAGE
 
 
 def load_importance_percent() -> dict[str, int]:
@@ -147,29 +217,7 @@ def _style_dark_ttk(style: ttk.Style, p: dict[str, str]) -> None:
 ToolName = Literal["select", "line", "rect", "ellipse", "fill", "crop"]
 LayerKind = Literal["image", "mask", "line", "rect", "ellipse"]
 AlignMode = Literal["left", "right", "top", "bottom", "center_h", "center_v", "center"]
-MaskShape = Literal[
-    "none",
-    "circle",
-    "rounded",
-    "heart",
-    "star",
-    "hexagon",
-    "diamond",
-    "octagon",
-    "triangle",
-    "pentagon",
-    "cross",
-    "arrow",
-    "edge_wave",
-    "edge_zigzag",
-    "edge_scallop",
-    "edge_arc",
-]
-EdgeSide = Literal["top", "bottom", "left", "right"]
-EDGE_SHAPES: tuple[str, ...] = ("edge_wave", "edge_zigzag", "edge_scallop", "edge_arc")
 EDGE_SIDE_LABELS: dict[EdgeSide, str] = {"top": "Top", "bottom": "Bottom", "left": "Left", "right": "Right"}
-# Depth of an edge cut, as a fraction of the box's size across the cut.
-EDGE_DEPTH = 0.18
 
 MASK_SHAPE_LABELS: dict[MaskShape, str] = {
     "none": "None (rectangle)",
@@ -188,6 +236,8 @@ MASK_SHAPE_LABELS: dict[MaskShape, str] = {
     "edge_zigzag": "Zigzag edge",
     "edge_scallop": "Scallop edge",
     "edge_arc": "Arc edge",
+    "dollar": "Dollar sign ($)",
+    "frame": "Border frame",
 }
 
 
@@ -196,495 +246,57 @@ def is_image_path(path: Path) -> bool:
     return path.suffix.lower() in SUPPORTED_EXTENSIONS
 
 
-def clamp(value: float, low: float, high: float) -> float:
-    """Clamp value to [low, high]."""
-    return max(low, min(high, value))
-
-
 def new_id() -> str:
     """Return a unique layer identifier."""
     return uuid.uuid4().hex[:12]
-
-
-def _star_vertices(cx: float, cy: float, outer_r: float, points: int = 5) -> list[tuple[float, float]]:
-    """Return vertices for a regular star centered at (cx, cy)."""
-    inner_r = outer_r * 0.6
-    verts: list[tuple[float, float]] = []
-    for i in range(points * 2):
-        angle = math.pi / 2 + i * math.pi / points
-        radius = outer_r if i % 2 == 0 else inner_r
-        verts.append((cx + radius * math.cos(angle), cy - radius * math.sin(angle)))
-    return verts
-
-
-def _regular_polygon_vertices(
-    cx: float,
-    cy: float,
-    radius: float,
-    sides: int,
-    rotation: float = -math.pi / 2,
-) -> list[tuple[float, float]]:
-    """Return vertices for a regular polygon."""
-    verts: list[tuple[float, float]] = []
-    for i in range(sides):
-        angle = rotation + i * 2 * math.pi / sides
-        verts.append((cx + radius * math.cos(angle), cy + radius * math.sin(angle)))
-    return verts
-
-
-def _heart_vertices(width: int, height: int) -> list[tuple[float, float]]:
-    """Return vertices tracing a heart stretched to fill the given box edge to edge."""
-    raw: list[tuple[float, float]] = []
-    for i in range(72):
-        t = 2 * math.pi * i / 72
-        hx = 16 * math.sin(t) ** 3
-        hy = -(
-            13 * math.cos(t)
-            - 5 * math.cos(2 * t)
-            - 2 * math.cos(3 * t)
-            - math.cos(4 * t)
-        )
-        raw.append((hx, hy))
-    # Normalise to the outline's real extents so the heart uses the whole box.
-    min_x = min(x for x, _ in raw)
-    max_x = max(x for x, _ in raw)
-    min_y = min(y for _, y in raw)
-    max_y = max(y for _, y in raw)
-    inset = 1.0
-    span_x = max(1.0, width - 2 * inset)
-    span_y = max(1.0, height - 2 * inset)
-    return [
-        (
-            inset + (x - min_x) / (max_x - min_x) * span_x,
-            inset + (y - min_y) / (max_y - min_y) * span_y,
-        )
-        for x, y in raw
-    ]
-
-
-def _edge_profile(kind: str, t: float) -> float:
-    """Cut depth, 0..1, at position t (0..1) along an edge shape's side."""
-    if kind == "edge_wave":
-        return 0.5 - 0.5 * math.cos(4 * math.pi * t)
-    if kind == "edge_zigzag":
-        # Triangle wave: three teeth, zero at both corners so the cut never reaches them.
-        return 1.0 - abs(2 * ((3 * t) % 1.0) - 1.0)
-    if kind == "edge_scallop":
-        # Three rounded bumps. Sine bumps meet the corners gently, so the cut stays off them.
-        return math.sin(math.pi * ((3 * t) % 1.0))
-    if kind == "edge_arc":
-        return math.sin(math.pi * t)
-    return 0.0
-
-
-def _edge_mask(width: int, height: int, kind: str, side: EdgeSide, flipped: bool) -> Image.Image:
-    """Rectangle whose one side follows an edge profile. The profile is drawn on the bottom
-    side and then rotated or mirrored onto the requested side."""
-    if side in ("left", "right"):
-        cw, ch = height, width
-    else:
-        cw, ch = width, height
-    depth = EDGE_DEPTH * ch
-    steps = max(2, cw)
-    points = [(0.0, 0.0), (float(cw), 0.0)]
-    for i in range(steps, -1, -1):
-        t = i / steps
-        f = _edge_profile(kind, t)
-        if flipped:
-            # Invert the bumps but taper to zero at the corners, so flipping never cuts them.
-            f = math.sin(math.pi * t) * (1.0 - f)
-        points.append((cw * t, ch - depth * f))
-    canonical = Image.new("L", (cw, ch), 0)
-    ImageDraw.Draw(canonical).polygon(points, fill=255)
-    if side == "top":
-        return canonical.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
-    if side == "right":
-        return canonical.transpose(Image.Transpose.ROTATE_90)
-    if side == "left":
-        return canonical.transpose(Image.Transpose.ROTATE_270)
-    return canonical
-
-
-def create_shape_mask(
-    width: int,
-    height: int,
-    shape: MaskShape,
-    corner_radius: int = 32,
-    side: EdgeSide = "bottom",
-    flipped: bool = False,
-) -> Image.Image:
-    """Build an L-mode mask (255 = visible) for the given shape."""
-    width = max(1, width)
-    height = max(1, height)
-    if shape in EDGE_SHAPES:
-        return _edge_mask(width, height, shape, side, flipped)
-    mask = Image.new("L", (width, height), 0)
-    if shape == "none":
-        return Image.new("L", (width, height), 255)
-
-    draw = ImageDraw.Draw(mask)
-    inset = 1
-    x1, y1 = inset, inset
-    x2, y2 = width - inset, height - inset
-    cx, cy = width / 2, height / 2
-
-    if shape == "circle":
-        draw.ellipse((x1, y1, x2, y2), fill=255)
-    elif shape == "rounded":
-        radius = int(clamp(corner_radius, 0, min(width, height) // 2))
-        # Full bounds, so a 0 radius gives a square mask with no transparent edge.
-        draw.rounded_rectangle((0, 0, width - 1, height - 1), radius=radius, fill=255)
-    elif shape == "heart":
-        draw.polygon(_heart_vertices(width, height), fill=255)
-    elif shape == "star":
-        outer_r = min(width, height) / 2 - inset
-        draw.polygon(_star_vertices(cx, cy, outer_r), fill=255)
-    elif shape == "hexagon":
-        # Flat top and bottom, sized so the hexagon fills the box width or height, whichever is tighter.
-        outer_r = min((width - 2 * inset) / 2, (height - 2 * inset) / math.sqrt(3))
-        draw.polygon(_regular_polygon_vertices(cx, cy, outer_r, 6, rotation=0.0), fill=255)
-    elif shape == "octagon":
-        outer_r = min(width, height) / 2 - inset
-        draw.polygon(_regular_polygon_vertices(cx, cy, outer_r, 8, rotation=-math.pi / 8), fill=255)
-    elif shape == "diamond":
-        draw.polygon(
-            [(cx, y1), (x2, cy), (cx, y2), (x1, cy)],
-            fill=255,
-        )
-    elif shape == "triangle":
-        draw.polygon([(cx, y1), (x2, y2), (x1, y2)], fill=255)
-    elif shape == "pentagon":
-        # Point up, sized to fit the tighter side of the box.
-        outer_r = min(width, height) / 2 - inset
-        draw.polygon(_regular_polygon_vertices(cx, cy, outer_r, 5, rotation=-math.pi / 2), fill=255)
-    elif shape == "cross":
-        # Plus sign with arms a third of the box wide.
-        arm = min(width, height) / 3
-        left, right = cx - arm / 2, cx + arm / 2
-        top, bottom = cy - arm / 2, cy + arm / 2
-        draw.polygon(
-            [
-                (left, y1), (right, y1), (right, top), (x2, top),
-                (x2, bottom), (right, bottom), (right, y2), (left, y2),
-                (left, bottom), (x1, bottom), (x1, top), (left, top),
-            ],
-            fill=255,
-        )
-    elif shape == "arrow":
-        # Block arrow pointing right: a shaft over the left part, a head on the right.
-        shaft = height / 4
-        head_x = x2 - width * 0.45
-        draw.polygon(
-            [
-                (x1, cy - shaft), (head_x, cy - shaft), (head_x, y1), (x2, cy),
-                (head_x, y2), (head_x, cy + shaft), (x1, cy + shaft),
-            ],
-            fill=255,
-        )
-    return mask
-
-
-def apply_shape_mask(image: Image.Image, mask: Image.Image) -> Image.Image:
-    """Multiply image alpha by a shape mask."""
-    rgba = image.convert("RGBA")
-    alpha = rgba.split()[3]
-    rgba.putalpha(ImageChops.multiply(alpha, mask))
-    return rgba
-
-
-def compute_arrangement(
-    aspects: list[float],
-    page_width: float,
-    page_height: float,
-    margin: float,
-    gap: float,
-    weights: Optional[list[float]] = None,
-) -> list[tuple[float, float, float, float]]:
-    """Return (x, y, w, h) cell footprints in page coordinates, one per aspect ratio.
-
-    Tries every grid column count, sizes uniform cells to fit the page, and keeps the
-    layout where the images cover the most area. Rows and the whole block are centred.
-    """
-    count = len(aspects)
-    avail_w = page_width - 2 * margin
-    avail_h = page_height - 2 * margin
-    if count == 0 or avail_w <= 0 or avail_h <= 0:
-        return []
-
-    best_cols = 0
-    best_area = -1.0
-    for cols in range(1, count + 1):
-        rows = math.ceil(count / cols)
-        cell_w = (avail_w - (cols - 1) * gap) / cols
-        cell_h = (avail_h - (rows - 1) * gap) / rows
-        if cell_w <= 0 or cell_h <= 0:
-            continue
-        area = 0.0
-        for aspect in aspects:
-            w = min(cell_w, cell_h * aspect)
-            area += w * (w / aspect)
-        if area > best_area:
-            best_area, best_cols = area, cols
-    if best_cols == 0:
-        return []
-
-    cols = best_cols
-    rows = math.ceil(count / cols)
-    cell_w = (avail_w - (cols - 1) * gap) / cols
-    cell_h = (avail_h - (rows - 1) * gap) / rows
-
-    sizes: list[tuple[float, float]] = []
-    for aspect in aspects:
-        w = min(cell_w, cell_h * aspect)
-        sizes.append((w, w / aspect))
-    if weights is not None and len(weights) == count:
-        # Area follows weight. The heaviest image keeps the full cell and the others shrink
-        # by the square root of their weight ratio, so the size ratios stay exact.
-        top_weight = max(1e-6, max(weights))
-        for i, aspect in enumerate(aspects):
-            factor = math.sqrt(max(1e-6, weights[i]) / top_weight)
-            w = min(sizes[i][0] * factor, cell_w, cell_h * aspect)
-            sizes[i] = (w, w / aspect)
-
-    row_indices = [list(range(start, min(start + cols, count))) for start in range(0, count, cols)]
-    row_dims: list[tuple[float, float]] = []
-    for idxs in row_indices:
-        row_w = sum(sizes[i][0] for i in idxs) + (len(idxs) - 1) * gap
-        row_h = max(sizes[i][1] for i in idxs)
-        row_dims.append((row_w, row_h))
-    total_h = sum(rh for _, rh in row_dims) + (len(row_dims) - 1) * gap
-
-    rects: list[tuple[float, float, float, float]] = [(0.0, 0.0, 0.0, 0.0)] * count
-    y = margin + (avail_h - total_h) / 2
-    for idxs, (row_w, row_h) in zip(row_indices, row_dims):
-        x = margin + (avail_w - row_w) / 2
-        for i in idxs:
-            w, h = sizes[i]
-            rects[i] = (x, y + (row_h - h) / 2, w, h)
-            x += w + gap
-        y += row_h + gap
-    return rects
-
-
-COLLAGE_GRID_CELLS = 240  # coverage grid resolution along the longer page side
-COLLAGE_MAX_GROW = 2.2  # largest factor an image may grow past its tile to fill masked gaps
-COLLAGE_GROW_STEPS = 12
-COLLAGE_OVERLAP_WEIGHT = 0.5  # score cost of covering a cell that is already covered
-COLLAGE_PASSES = 2
-COLLAGE_DEFAULT_OVERLAP_PCT = 10
-COLLAGE_DEFAULT_CORNER_PCT = 20  # corner radius as a percent of the cell's shorter side
-COLLAGE_MAX_CORNER_PCT = 50
-COLLAGE_MAX_STROKE = 50
-
-
-def _tile_guillotine(
-    indices: list[int],
-    x: float,
-    y: float,
-    w: float,
-    h: float,
-    out: list[tuple[float, float, float, float]],
-    weights: list[float],
-) -> None:
-    """Split a rectangle into one tile per index. Each tile's area is proportional to its weight.
-
-    The split falls where the running weight is closest to half, and the longer side is cut.
-    With equal weights this is an even split by count.
-    """
-    if len(indices) == 1:
-        out[indices[0]] = (x, y, w, h)
-        return
-    total = sum(weights[i] for i in indices)
-    split = 1
-    best = None
-    running = 0.0
-    for k in range(1, len(indices)):
-        running += weights[indices[k - 1]]
-        diff = abs(running - total / 2)
-        if best is None or diff < best - 1e-12:
-            best, split = diff, k
-    left, right = indices[:split], indices[split:]
-    frac = sum(weights[i] for i in left) / total
-    if w >= h:
-        left_w = w * frac
-        _tile_guillotine(left, x, y, left_w, h, out, weights)
-        _tile_guillotine(right, x + left_w, y, w - left_w, h, out, weights)
-    else:
-        left_h = h * frac
-        _tile_guillotine(left, x, y, w, left_h, out, weights)
-        _tile_guillotine(right, x, y + left_h, w, h - left_h, out, weights)
-
-
-def _shape_cells(
-    shape: MaskShape,
-    x0: float,
-    y0: float,
-    x1: float,
-    y1: float,
-    grid_w: int,
-    grid_h: int,
-    corner_fraction: float,
-) -> set[int]:
-    """Grid cells (index = row * grid_w + col) covered by a shape filling the box, clipped to the page."""
-    ox, oy = math.floor(x0), math.floor(y0)
-    mw, mh = math.ceil(x1) - ox, math.ceil(y1) - oy
-    if mw < 1 or mh < 1:
-        return set()
-    mask = create_shape_mask(mw, mh, shape, corner_radius=int(corner_fraction * min(mw, mh)))
-    pixels = mask.load()
-    cells: set[int] = set()
-    for row in range(max(0, oy), min(grid_h, oy + mh)):
-        for col in range(max(0, ox), min(grid_w, ox + mw)):
-            if pixels[col - ox, row - oy] >= 128:
-                cells.add(row * grid_w + col)
-    return cells
-
-
-def compute_collage(
-    aspects: list[float],
-    page_width: float,
-    page_height: float,
-    shape: MaskShape,
-    max_overlap: float = 1.0,
-    corner_fraction: float = COLLAGE_DEFAULT_CORNER_PCT / 100,
-    weights: Optional[list[float]] = None,
-) -> tuple[list[tuple[float, float, float, float]], float, float]:
-    """Lay out images to fill the page with minimal overlap.
-
-    max_overlap caps the overlap as a fraction of covered area: growth that would take the
-    overall overlap past it is skipped. Returns (rects, coverage, overlap): one (x, y, w, h)
-    per aspect in page coordinates, the fraction of the page covered by visible shapes, and
-    the fraction of covered cells that are covered by more than one image.
-    """
-    count = len(aspects)
-    if count == 0 or page_width <= 0 or page_height <= 0:
-        return [], 0.0, 0.0
-
-    scale = COLLAGE_GRID_CELLS / max(page_width, page_height)
-    grid_w = max(1, round(page_width * scale))
-    grid_h = max(1, round(page_height * scale))
-    unit_x = page_width / grid_w
-    unit_y = page_height / grid_h
-
-    # Tiles covering the whole grid, sized by weight (equal when none given), similar aspects next to each other.
-    weight_list = [max(1e-6, float(v)) for v in weights] if weights is not None else [1.0] * count
-    tiles: list[tuple[float, float, float, float]] = [(0.0, 0.0, 0.0, 0.0)] * count
-    order = sorted(range(count), key=lambda i: aspects[i])
-    _tile_guillotine(order, 0.0, 0.0, float(grid_w), float(grid_h), tiles, weight_list)
-
-    def rect_for(i: int, factor: float) -> tuple[float, float, float, float]:
-        tx, ty, tw, th = tiles[i]
-        w, h = tw * factor, th * factor
-        return tx + tw / 2 - w / 2, ty + th / 2 - h / 2, w, h
-
-    def cells_for(i: int, factor: float) -> set[int]:
-        x, y, w, h = rect_for(i, factor)
-        return _shape_cells(shape, x, y, x + w, y + h, grid_w, grid_h, corner_fraction)
-
-    factors = [1.0] * count
-    footprints = [cells_for(i, 1.0) for i in range(count)]
-    cover = [0] * (grid_w * grid_h)
-    # covered: cells with at least one image; overlapped: cells with at least two.
-    covered = 0
-    overlapped = 0
-    for cells in footprints:
-        for cell in cells:
-            if cover[cell] == 0:
-                covered += 1
-            elif cover[cell] == 1:
-                overlapped += 1
-            cover[cell] += 1
-
-    # Visit images with the most empty space in their tile first. Each one grows only when
-    # the extra cells it gains outweigh the penalty for re-covering cells already visible,
-    # and only while the overall overlap stays within max_overlap.
-    steps = [1.0 + (COLLAGE_MAX_GROW - 1.0) * s / COLLAGE_GROW_STEPS for s in range(COLLAGE_GROW_STEPS + 1)]
-    for _ in range(COLLAGE_PASSES):
-        visit = sorted(range(count), key=lambda i: len(footprints[i]))
-        for i in visit:
-            # Take this image's footprint out of the counts before testing alternatives.
-            for cell in footprints[i]:
-                if cover[cell] == 1:
-                    covered -= 1
-                elif cover[cell] == 2:
-                    overlapped -= 1
-                cover[cell] -= 1
-            best_score = None
-            best_factor = 1.0
-            best_cells: set[int] = set()
-            for factor in steps:
-                cand = cells_for(i, factor)
-                gain = 0
-                touched = 0
-                newly_overlapped = 0
-                for c in cand:
-                    if cover[c] == 0:
-                        gain += 1
-                    else:
-                        touched += 1
-                        if cover[c] == 1:
-                            newly_overlapped += 1
-                new_covered = covered + gain
-                new_overlapped = overlapped + newly_overlapped
-                # The unchanged tile (factor 1.0) is always allowed, so the cap never forces a worse layout.
-                if factor > 1.0 and new_covered and new_overlapped > max_overlap * new_covered:
-                    continue
-                score = gain - COLLAGE_OVERLAP_WEIGHT * touched
-                if best_score is None or score > best_score + 1e-9:
-                    best_score, best_factor, best_cells = score, factor, cand
-            factors[i] = best_factor
-            footprints[i] = best_cells
-            for cell in best_cells:
-                if cover[cell] == 0:
-                    covered += 1
-                elif cover[cell] == 1:
-                    overlapped += 1
-                cover[cell] += 1
-
-    covered = sum(1 for c in cover if c > 0)
-    overlapped = sum(1 for c in cover if c > 1)
-    total = grid_w * grid_h
-    coverage = covered / total
-    overlap = overlapped / covered if covered else 0.0
-
-    rects: list[tuple[float, float, float, float]] = []
-    for i in range(count):
-        x, y, w, h = rect_for(i, factors[i])
-        rects.append((x * unit_x, y * unit_y, w * unit_x, h * unit_y))
-    return rects, coverage, overlap
-
-
-def aspect_locked_corner_rect(
-    mode: str,
-    x1: float,
-    y1: float,
-    x2: float,
-    y2: float,
-    aspect: float,
-    min_size: float,
-) -> tuple[float, float, float, float]:
-    """Adjust a corner-drag rectangle so its width / height stays at aspect.
-
-    The corner opposite the dragged handle stays put. The larger of the two sizes wins,
-    so the box follows whichever direction the cursor moved further.
-    """
-    w = max(x2 - x1, (y2 - y1) * aspect, min_size, min_size * aspect)
-    h = w / aspect
-    if mode == "se":
-        return x1, y1, x1 + w, y1 + h
-    if mode == "nw":
-        return x2 - w, y2 - h, x2, y2
-    if mode == "ne":
-        return x1, y2 - h, x1 + w, y2
-    if mode == "sw":
-        return x2 - w, y1, x2, y1 + h
-    return x1, y1, x2, y2
 
 
 def record_resize_percent(layer: ImageLayer) -> None:
     """Store the layer's displayed size as a percent of its original (pre-collage) pixels."""
     base = layer.collage_source if layer.collage_source is not None else layer.source
     layer.resize_percent = layer.width / max(1, base.width) * 100
+
+
+def random_stroke_color() -> str:
+    """A random, fairly vivid colour as #rrggbb. Saturation and brightness stay high enough to read on a page."""
+    r, g, b = colorsys.hsv_to_rgb(random.random(), random.uniform(0.6, 0.95), random.uniform(0.6, 0.95))
+    return f"#{round(r * 255):02x}{round(g * 255):02x}{round(b * 255):02x}"
+
+
+# Opacity of the unclipped image shown under a mask while that mask is selected.
+MASK_GUIDE_OPACITY = 0.35
+
+
+def _unmasked_pixels(
+    base: Image.Image,
+    base_rect: tuple[float, float, float, float],
+    box: tuple[float, float, float, float],
+) -> Image.Image:
+    """The part of base that lies under box (page coordinates), with no mask applied.
+
+    base_rect is where base sits on the page. Pixels outside base stay transparent.
+    """
+    bx, by, bw, bh = base_rect
+    x, y, w, h = box
+    scale_x = base.width / max(bw, 1e-6)
+    scale_y = base.height / max(bh, 1e-6)
+    left = round((x - bx) * scale_x)
+    top = round((y - by) * scale_y)
+    right = max(left + 1, round((x + w - bx) * scale_x))
+    bottom = max(top + 1, round((y + h - by) * scale_y))
+    return base.convert("RGBA").crop((left, top, right, bottom))
+
+
+def _is_hex_color(value: str) -> bool:
+    return len(value) == 7 and value.startswith("#") and all(ch in "0123456789abcdefABCDEF" for ch in value[1:])
+
+
+def _collage_size(layer: ImageLayer) -> tuple[float, float]:
+    """The size the image was set to on the board, before any collage. Collage weights use this,
+    so an image the user made bigger keeps a bigger share of the page after a re-run."""
+    if layer.collage_source is not None and layer.applied_mask is not None:
+        return layer.applied_mask.base_w, layer.applied_mask.base_h
+    return layer.width, layer.height
 
 
 def _collage_base(layer: ImageLayer) -> Image.Image:
@@ -734,7 +346,7 @@ def dilate_alpha(alpha: Image.Image, radius: int) -> Image.Image:
     return _sliding_max(out, length, False, radius)
 
 
-def compose_image_layer(
+def _compose_bordered_image(
     layer: ImageLayer,
     masks: Optional[list["MaskLayer"]] = None,
 ) -> tuple[Image.Image, int, int]:
@@ -744,8 +356,9 @@ def compose_image_layer(
     - stroke before mask (default): a rectangle around the image, then cut by the masks.
     - stroke after mask: an outline around the visible, masked shape.
     """
+    rx, ry, rw, rh = source_page_rect(layer)
     resized = layer.source.convert("RGBA").resize(
-        (max(1, int(layer.width)), max(1, int(layer.height))),
+        (max(1, int(rw)), max(1, int(rh))),
         Image.Resampling.LANCZOS,
     )
     if layer.opacity < 1.0:
@@ -754,7 +367,7 @@ def compose_image_layer(
         resized.putalpha(alpha)
 
     mask_list = masks or []
-    x, y = int(layer.x), int(layer.y)
+    x, y = int(rx), int(ry)
     bw = max(0, layer.border_width)
     if bw == 0:
         return clip_to_masks(resized, x, y, mask_list), x, y
@@ -785,6 +398,109 @@ def compose_image_layer(
     return clip_to_masks(bordered, x - bw, y - bw, mask_list), x - bw, y - bw
 
 
+def source_page_rect(layer: ImageLayer) -> tuple[float, float, float, float]:
+    """Page rectangle (x, y, w, h) that the layer's pixels cover. Equals the box unless source_rect is set."""
+    if layer.source_rect is None:
+        return layer.x, layer.y, layer.width, layer.height
+    rx, ry, rw, rh = layer.source_rect
+    return layer.x + rx, layer.y + ry, rw, rh
+
+
+def flatten_source_rect(layer: ImageLayer) -> None:
+    """Crop the pixels to the layer's box so the box can be resized like any other image.
+
+    Pixels outside the box are dropped. The layer's source changes identity, so Edit applied
+    mask no longer offers to restore them.
+    """
+    if layer.source_rect is None:
+        return
+    rx, ry, rw, rh = source_page_rect(layer)
+    sw, sh = layer.source.width, layer.source.height
+    scale_x = sw / rw
+    scale_y = sh / rh
+    left = clamp(round((layer.x - rx) * scale_x), 0, sw - 1)
+    top = clamp(round((layer.y - ry) * scale_y), 0, sh - 1)
+    right = clamp(round((layer.x + layer.width - rx) * scale_x), left + 1, sw)
+    bottom = clamp(round((layer.y + layer.height - ry) * scale_y), top + 1, sh)
+    layer.source = layer.source.crop((left, top, right, bottom))
+    layer.source_rect = None
+
+
+def _shift_l(img: Image.Image, dx: int, dy: int) -> Image.Image:
+    """Move an L-mode image by (dx, dy); pixels moved off the canvas are dropped, gaps are 0."""
+    out = Image.new("L", img.size, 0)
+    out.paste(img, (dx, dy))
+    return out
+
+
+def apply_bevel(img: Image.Image, size: int) -> Image.Image:
+    """Light the top-left rim and shade the bottom-right rim of the visible shape."""
+    alpha = img.split()[3]
+    rgb = img.convert("RGB")
+    soft = max(1, size // 3)
+    lit = ImageChops.subtract(alpha, _shift_l(alpha, size, size)).filter(ImageFilter.GaussianBlur(soft))
+    shaded = ImageChops.subtract(alpha, _shift_l(alpha, -size, -size)).filter(ImageFilter.GaussianBlur(soft))
+    rgb = Image.composite(Image.new("RGB", rgb.size, "#ffffff"), rgb, lit.point(lambda v: int(v * 0.5)))
+    rgb = Image.composite(Image.new("RGB", rgb.size, "#000000"), rgb, shaded.point(lambda v: int(v * 0.5)))
+    out = rgb.convert("RGBA")
+    out.putalpha(alpha)
+    return out
+
+
+def apply_emboss(img: Image.Image, strength: float) -> Image.Image:
+    """Blend a relief (emboss) of the image's brightness into its colours."""
+    alpha = img.split()[3]
+    rgb = img.convert("RGB")
+    relief = rgb.convert("L").filter(ImageFilter.EMBOSS)
+    relief_rgb = Image.merge("RGB", (relief, relief, relief))
+    embossed = ImageChops.add(rgb, relief_rgb, 1.0, -128)
+    out = Image.blend(rgb, embossed, strength).convert("RGBA")
+    out.putalpha(alpha)
+    return out
+
+
+def apply_shadow(
+    img: Image.Image,
+    offset: int,
+    blur: int,
+    color: str,
+    opacity: float,
+) -> tuple[Image.Image, int]:
+    """Place a blurred, offset copy of the shape under the image. Returns the canvas and its padding."""
+    pad = 3 * blur + abs(offset)
+    size = (img.width + pad * 2, img.height + pad * 2)
+    padded_alpha = Image.new("L", size, 0)
+    padded_alpha.paste(img.split()[3], (pad, pad))
+    shadow_alpha = _shift_l(padded_alpha, offset, offset)
+    if blur > 0:
+        shadow_alpha = shadow_alpha.filter(ImageFilter.GaussianBlur(blur))
+    shadow_alpha = shadow_alpha.point(lambda v: int(v * opacity))
+    shadow = Image.new("RGBA", size, color)
+    shadow.putalpha(shadow_alpha)
+    top = Image.new("RGBA", size, (0, 0, 0, 0))
+    top.paste(img, (pad, pad))
+    shadow.alpha_composite(top)
+    return shadow, pad
+
+
+def compose_image_layer(
+    layer: ImageLayer,
+    masks: Optional[list["MaskLayer"]] = None,
+) -> tuple[Image.Image, int, int]:
+    """Rasterize an image layer with its border, masks and effects. Returns (image, ox, oy)."""
+    composed, ox, oy = _compose_bordered_image(layer, masks)
+    fx = layer.effects
+    if fx.bevel and fx.bevel_size > 0:
+        composed = apply_bevel(composed, fx.bevel_size)
+    if fx.emboss and fx.emboss_strength > 0:
+        composed = apply_emboss(composed, fx.emboss_strength)
+    if fx.shadow:
+        composed, pad = apply_shadow(composed, fx.shadow_offset, fx.shadow_blur, fx.shadow_color, fx.shadow_opacity)
+        ox -= pad
+        oy -= pad
+    return composed, ox, oy
+
+
 def mask_alpha(
     width: int,
     height: int,
@@ -806,8 +522,10 @@ def mask_alpha(
         mh,
         mask.shape,
         round(mask.corner_radius * min(scale_x, scale_y)),
-        side=mask.side,
+        sides=mask.sides,
         flipped=mask.flipped,
+        peaks=mask.peaks,
+        amplitude=round(mask.amplitude * min(scale_x, scale_y)),
     )
     alpha = Image.new("L", (width, height), 0)
     alpha.paste(
@@ -853,6 +571,8 @@ def clone_board_layer(layer: BoardLayer, *, assign_new_id: bool = False) -> Boar
             resize_percent=layer.resize_percent,
             applied_mask=layer.applied_mask,
             stroke_after_mask=layer.stroke_after_mask,
+            effects=layer.effects,
+            source_rect=layer.source_rect,
         )
     if isinstance(layer, MaskLayer):
         return replace(layer, id=layer_id)
@@ -928,8 +648,28 @@ class AppliedMask:
     mask_h: float
     shape: MaskShape
     corner_radius: int
-    side: EdgeSide = "bottom"
+    sides: tuple[EdgeSide, ...] = ("bottom",)
     flipped: bool = False
+    peaks: int = 0
+    amplitude: int = 0
+    # (x, y, w, h) in page coordinates where Edit applied mask should place the base pixels.
+    # None: use the base_* rectangle. Make collage sets it so the image keeps its collage size and position.
+    restore_rect: Optional[tuple[float, float, float, float]] = None
+
+
+@dataclass(frozen=True)
+class ImageEffects:
+    """Optional look-and-feel effects for an image. Frozen so undo snapshots can share it."""
+
+    shadow: bool = False
+    shadow_offset: int = 12
+    shadow_blur: int = 10
+    shadow_color: str = "#000000"
+    shadow_opacity: float = 0.6
+    bevel: bool = False
+    bevel_size: int = 6
+    emboss: bool = False
+    emboss_strength: float = 0.6
 
 
 @dataclass
@@ -958,6 +698,10 @@ class ImageLayer:
     # False: the border is a rectangle around the image, cut by any mask.
     # True: the border follows the masked shape's outline.
     stroke_after_mask: bool = False
+    effects: ImageEffects = field(default_factory=ImageEffects)
+    # None: the pixels fill the box. Set by Edit applied mask: (x, y, w, h) of the restored pixels,
+    # with x and y relative to the box's top-left, so the box stays where the user left it.
+    source_rect: Optional[tuple[float, float, float, float]] = None
 
 
 @dataclass
@@ -973,9 +717,12 @@ class MaskLayer:
     height: float = 100.0
     shape: MaskShape = "circle"
     corner_radius: int = 32
-    # Edge shapes cut only one side: which side, and whether the cut is mirrored.
-    side: EdgeSide = "bottom"
+    # Edge shapes cut the chosen sides: which sides, and whether the cuts are mirrored.
+    sides: tuple[EdgeSide, ...] = ("bottom",)
     flipped: bool = False
+    # Edge shapes: number of waves/teeth/bumps per side (0 = shape default) and their depth in px (0 = default).
+    peaks: int = 0
+    amplitude: int = 0
     # Set once the user has dragged or resized the mask; enables Apply mask.
     positioned: bool = False
 
@@ -1083,10 +830,10 @@ class PosterCanvas(tk.Canvas):
     ) -> None:
         super().__init__(master, bg="#3d3d3d", highlightthickness=0, **kwargs)
         self._on_selection_change = on_selection_change
-        # Default page: US Letter at 150 DPI, landscape.
-        self.page_width = 1650
-        self.page_height = 1275
-        self.page_bg = "#ffffff"
+        # Set by the app: called with the image layer when "Generate with AI…" is chosen.
+        self.on_ai_edit: Optional[Callable[[ImageLayer], None]] = None
+        # Default page: the one saved with Set as default page, or US Letter at 150 DPI, landscape.
+        self.page_width, self.page_height, self.page_bg = load_default_page()
         self.paint_layer = Image.new(
             "RGB",
             (self.page_width, self.page_height),
@@ -1116,8 +863,11 @@ class PosterCanvas(tk.Canvas):
         self._undo_stack: list[BoardSnapshot] = []
         # Incremented on every undo checkpoint so panels can tell when history has moved on.
         self.history_version = 0
+        # (mask id, undo depth before the mask edit began) while a mask is being added or edited.
+        self.mask_session: Optional[tuple[str, int]] = None
         self._redo_stack: list[BoardSnapshot] = []
         self._restoring_history = False
+        self._history_listener: Optional[Callable[[], None]] = None
         self._clipboard_layers: list[BoardLayer] = []
         self._drag_had_undo = False
 
@@ -1193,11 +943,54 @@ class PosterCanvas(tk.Canvas):
             self._undo_stack.pop(0)
         self._redo_stack.clear()
         self.history_version += 1
+        self._notify_history()
 
     def clear_history(self) -> None:
         """Drop undo and redo stacks."""
         self._undo_stack.clear()
         self._redo_stack.clear()
+        self._notify_history()
+
+    def set_history_listener(self, listener: Callable[[], None]) -> None:
+        """Call listener whenever the undo or redo stacks change."""
+        self._history_listener = listener
+
+    def _notify_history(self) -> None:
+        if self._history_listener is not None:
+            self._history_listener()
+
+    def history_timeline(self) -> tuple[list[str], int]:
+        """Return labels for every saved state, oldest first, and the index of the current one."""
+        def describe(layers: list[BoardLayer], width: int, height: int) -> str:
+            count = len(layers)
+            return f"{count} layer{'s' if count != 1 else ''} · {width}×{height} px"
+
+        labels: list[str] = []
+        for index, snapshot in enumerate(self._undo_stack):
+            name = "Start" if index == 0 else f"Step {index}"
+            labels.append(f"{name}: {describe(snapshot.layers, snapshot.page_width, snapshot.page_height)}")
+        current = len(labels)
+        labels.append(f"Step {current} (current): {describe(self.layers, self.page_width, self.page_height)}")
+        for offset, snapshot in enumerate(reversed(self._redo_stack), start=1):
+            labels.append(
+                f"Step {current + offset}: {describe(snapshot.layers, snapshot.page_width, snapshot.page_height)}"
+            )
+        return labels, current
+
+    def jump_to_history(self, index: int) -> bool:
+        """Move the board to a saved state by undoing or redoing step by step. Returns False if not possible."""
+        if self.mask_session is not None:
+            return False
+        current = len(self._undo_stack)
+        if index == current or not 0 <= index <= current + len(self._redo_stack):
+            return False
+        if index < current:
+            for _ in range(current - index):
+                self.undo()
+        else:
+            for _ in range(index - current):
+                self.redo()
+        return True
 
     def can_undo(self) -> bool:
         """Return True if undo is available."""
@@ -1214,6 +1007,7 @@ class PosterCanvas(tk.Canvas):
         self._redo_stack.append(self.capture_snapshot())
         snapshot = self._undo_stack.pop()
         self._restore_snapshot(snapshot)
+        self._notify_history()
         return True
 
     def redo(self) -> bool:
@@ -1223,6 +1017,7 @@ class PosterCanvas(tk.Canvas):
         self._undo_stack.append(self.capture_snapshot())
         snapshot = self._redo_stack.pop()
         self._restore_snapshot(snapshot)
+        self._notify_history()
         return True
 
     def copy_selected(self) -> bool:
@@ -1289,6 +1084,10 @@ class PosterCanvas(tk.Canvas):
 
     def set_selection(self, layer_ids: list[str], *, notify: bool = True) -> None:
         """Replace the selection. The last id becomes the active layer."""
+        # A mask edit survives clicks on other layers (e.g. the image under the mask);
+        # it ends only when the mask is applied, cancelled, or no longer exists.
+        if self.mask_session is not None and self.get_layer(self.mask_session[0]) is None:
+            self.mask_session = None
         self.selected_ids = [layer_id for layer_id in dict.fromkeys(layer_ids) if self.get_layer(layer_id)]
         if notify:
             self._on_selection_change(self.selected_layer())
@@ -1323,14 +1122,43 @@ class PosterCanvas(tk.Canvas):
         """Return the active layer."""
         return self.get_layer(self.selected_id)
 
-    def displayed_stroke(self) -> tuple[str, int]:
-        """Stroke colour and width of the selected shape, or the defaults when none is selected."""
-        layer = self.selected_layer()
+    def _stroke_targets(self) -> list[BoardLayer]:
+        """Selected layers that have a stroke: lines, rectangles, ellipses and images."""
+        return [
+            layer
+            for layer in self.selected_layers()
+            if isinstance(layer, (LineLayer, RectLayer, EllipseLayer, ImageLayer))
+        ]
+
+    @staticmethod
+    def _layer_stroke(layer: BoardLayer) -> tuple[str, int]:
         if isinstance(layer, LineLayer):
             return layer.color, layer.width
-        if isinstance(layer, (RectLayer, EllipseLayer)):
-            return layer.outline, layer.width
-        return self.stroke_color, self.stroke_width
+        if isinstance(layer, ImageLayer):
+            return layer.border_color, layer.border_width
+        return layer.outline, layer.width  # type: ignore[union-attr]
+
+    @staticmethod
+    def _set_layer_stroke(layer: BoardLayer, color: str, width: int) -> None:
+        if isinstance(layer, LineLayer):
+            layer.color = color
+            layer.width = width
+        elif isinstance(layer, ImageLayer):
+            layer.border_color = color
+            layer.border_width = max(0, width)
+            # Follow the mask edge, so the outline matches the visible shape.
+            layer.stroke_after_mask = True
+        else:
+            layer.outline = color  # type: ignore[union-attr]
+            layer.width = width  # type: ignore[union-attr]
+
+    def displayed_stroke(self) -> tuple[str, int]:
+        """Stroke colour and width of the first selected stroke target, or the defaults when none is selected."""
+        targets = self._stroke_targets()
+        if not targets:
+            return self.stroke_color, self.stroke_width
+        color, width = self._layer_stroke(targets[0])
+        return color, max(1, width)
 
     def apply_stroke_style(
         self,
@@ -1339,29 +1167,27 @@ class PosterCanvas(tk.Canvas):
         width: Optional[int] = None,
         undo: bool = True,
     ) -> bool:
-        """Update the default stroke for new shapes and restyle the selected shape.
+        """Update the default stroke for new shapes and restyle every selected line, shape and image.
 
-        Returns True when the selected shape actually changed.
+        Returns True when at least one selected layer actually changed.
         """
         if color is not None:
             self.stroke_color = color
         if width is not None:
             self.stroke_width = width
-        layer = self.selected_layer()
-        if not isinstance(layer, (LineLayer, RectLayer, EllipseLayer)):
-            return False
-        cur_color, cur_width = self.displayed_stroke()
-        new_color = color if color is not None else cur_color
-        new_width = width if width is not None else cur_width
-        if new_color == cur_color and new_width == cur_width:
+        changes: list[tuple[BoardLayer, str, int]] = []
+        for layer in self._stroke_targets():
+            cur_color, cur_width = self._layer_stroke(layer)
+            new_color = color if color is not None else cur_color
+            new_width = width if width is not None else cur_width
+            if new_color != cur_color or new_width != cur_width:
+                changes.append((layer, new_color, new_width))
+        if not changes:
             return False
         if undo:
             self.push_undo_checkpoint()
-        if isinstance(layer, LineLayer):
-            layer.color = new_color
-        else:
-            layer.outline = new_color
-        layer.width = new_width
+        for layer, new_color, new_width in changes:
+            self._set_layer_stroke(layer, new_color, new_width)
         self.redraw()
         return True
 
@@ -1444,9 +1270,21 @@ class PosterCanvas(tk.Canvas):
         )
         menu.add_separator()
         menu.add_command(
+            label="Generate with AI…",
+            command=lambda: self.on_ai_edit(hit) if self.on_ai_edit else None,
+            state="normal" if self.on_ai_edit else "disabled",
+        )
+        menu.add_separator()
+        menu.add_command(
             label="Edit applied mask",
             command=lambda: self.edit_applied_mask(hit.id),
             state="normal" if self.can_edit_applied_mask(hit.id) else "disabled",
+        )
+        menu.add_command(label="Edit stroke…", command=lambda: self._edit_stroke_dialog(hit))
+        menu.add_command(
+            label="Remove mask",
+            command=lambda: self.remove_mask(hit.id),
+            state="normal" if self.can_remove_mask(hit.id) else "disabled",
         )
         menu.add_separator()
         menu.add_command(
@@ -1560,12 +1398,31 @@ class PosterCanvas(tk.Canvas):
         self,
         margin: float = ARRANGE_DEFAULT_MARGIN,
         gap: float = ARRANGE_DEFAULT_GAP,
+        resize: bool = True,
     ) -> bool:
-        """Position and size the images not moved by hand so they fit on the page without overlap."""
+        """Position the images not moved by hand so they sit on the page without overlap.
+
+        With resize=True they are also scaled to fill the page; with resize=False they keep
+        their current size and are placed in wrapped rows (which may run off the page).
+        """
         # Images the user has dragged keep their place and size.
         images = [layer for layer in self.layers if isinstance(layer, ImageLayer) and not layer.user_placed]
         if not images:
             return False
+        if not resize:
+            sizes = [
+                (layer.width + 2 * max(0, layer.border_width), layer.height + 2 * max(0, layer.border_width))
+                for layer in images
+            ]
+            positions, _fits = compute_shelf_layout(sizes, self.page_width, self.page_height, margin, gap)
+            self.push_undo_checkpoint()
+            for layer, (x, y) in zip(images, positions):
+                bw = max(0, layer.border_width)
+                layer.x = x + bw
+                layer.y = y + bw
+            self._on_selection_change(self.selected_layer())
+            self.redraw()
+            return True
         aspects = [layer.source.width / max(1, layer.source.height) for layer in images]
         weights = [layer.resize_percent for layer in images]
         rects = compute_arrangement(aspects, self.page_width, self.page_height, margin, gap, weights)
@@ -1581,6 +1438,7 @@ class PosterCanvas(tk.Canvas):
             inner_h = max(MIN_LAYER_SIZE, h - 2 * bw)
             img_w = min(inner_w, inner_h * aspect)
             img_h = img_w / aspect
+            flatten_source_rect(layer)
             layer.width = img_w
             layer.height = img_h
             layer.x = x + bw + (inner_w - img_w) / 2
@@ -1598,30 +1456,45 @@ class PosterCanvas(tk.Canvas):
         stroke_width: int = 0,
         stroke_color: str = "#000000",
         corner_fraction: float = COLLAGE_DEFAULT_CORNER_PCT / 100,
+        items: Optional[dict[str, CollageItemOptions]] = None,
     ) -> Optional[tuple[float, float]]:
-        """Fill the page with every image, each cropped to its cell and masked with shape.
+        """Fill the page with every image, each cropped to its cell and masked.
 
-        max_overlap is a fraction of covered area. A stroke, when set, is drawn just inside
-        each cell and follows the masked shape.
+        shape, stroke_width and stroke_color are the defaults. items gives an image its own
+        resize percent, mask shape and stroke; images not listed use the defaults.
+        max_overlap is a fraction of covered area. Each stroke is drawn just inside its cell
+        and follows the masked shape.
         Returns (coverage, overlap) as fractions, or None when there was nothing to lay out.
         """
         images = [layer for layer in self.layers if isinstance(layer, ImageLayer)]
         if not images:
             return None
+        options = [
+            (items or {}).get(layer.id)
+            or CollageItemOptions(
+                percent=100.0,
+                shape=shape,
+                stroke_width=stroke_width,
+                stroke_color=stroke_color,
+            )
+            for layer in images
+        ]
         aspects = [_collage_base(layer).width / max(1, _collage_base(layer).height) for layer in images]
         rects, coverage, overlap = compute_collage(
             aspects,
             self.page_width,
             self.page_height,
-            shape,
+            [option.shape for option in options],
             max_overlap=max_overlap,
             corner_fraction=corner_fraction,
-            weights=[layer.resize_percent for layer in images],
+            weights=[
+                _collage_size(layer)[0] * _collage_size(layer)[1] * option.percent / 100
+                for layer, option in zip(images, options)
+            ],
         )
         if not rects:
             return None
 
-        bw = max(0, int(stroke_width))
         self.push_undo_checkpoint()
         # Masks left over from earlier edits no longer match the new layout; the collage replaces them.
         laid_out = {layer.id for layer in images}
@@ -1630,7 +1503,9 @@ class PosterCanvas(tk.Canvas):
             if not (isinstance(layer, MaskLayer) and layer.target_id in laid_out)
         ]
         self.set_selection([i for i in self.selected_ids if self.get_layer(i) is not None])
-        for layer, (x, y, w, h) in zip(images, rects):
+        for layer, (x, y, w, h), option in zip(images, rects, options):
+            bw = max(0, int(option.stroke_width))
+            item_shape = option.shape
             # The stroke is drawn outside the image's box, so inset the box to keep it in the cell.
             x, y = x + bw, y + bw
             w = max(MIN_LAYER_SIZE, w - 2 * bw)
@@ -1649,15 +1524,25 @@ class PosterCanvas(tk.Canvas):
             alpha = create_shape_mask(
                 cropped.width,
                 cropped.height,
-                shape,
+                item_shape,
                 corner_radius=int(corner_fraction * min(cropped.width, cropped.height)),
             )
             cropped.putalpha(ImageChops.multiply(cropped.split()[3], alpha))
             layer.source = cropped
+            layer.source_rect = None
             layer.x, layer.y, layer.width, layer.height = x, y, w, h
             layer.border_width = bw
-            layer.border_color = stroke_color
+            layer.border_color = option.stroke_color
             layer.stroke_after_mask = bw > 0
+            # Where the full, uncropped pixels sit when the crop fills the box.
+            sx = w / cropped.width
+            sy = h / cropped.height
+            restore_rect = (
+                x - ((base.width - cropped.width) // 2) * sx,
+                y - ((base.height - cropped.height) // 2) * sy,
+                base.width * sx,
+                base.height * sy,
+            )
             # Record the baked mask like Apply mask does, so Edit applied mask can bring it back.
             layer.applied_mask = AppliedMask(
                 base_source=base,
@@ -1674,13 +1559,64 @@ class PosterCanvas(tk.Canvas):
                 mask_y=y,
                 mask_w=w,
                 mask_h=h,
-                shape=shape,
+                shape=item_shape,
                 corner_radius=int(corner_fraction * min(w, h)),
+                restore_rect=restore_rect,
             )
 
         self._on_selection_change(self.selected_layer())
         self.redraw()
         return coverage, overlap
+
+    def can_remove_mask(self, image_id: str) -> bool:
+        """True when the image has a live mask, or an applied mask that can still be undone."""
+        return bool(self.masks_for(image_id)) or self.can_edit_applied_mask(image_id)
+
+    def remove_mask(self, image_id: str) -> bool:
+        """Remove the image's mask. A live mask is deleted. For an applied mask the image keeps its
+        current position and size and shows its pixels without the mask."""
+        image = self.get_layer(image_id)
+        if not isinstance(image, ImageLayer):
+            return False
+        if self.masks_for(image_id):
+            self.push_undo_checkpoint()
+            self.layers = [
+                layer
+                for layer in self.layers
+                if not (isinstance(layer, MaskLayer) and layer.target_id == image_id)
+            ]
+            self.set_selection([i for i in self.selected_ids if self.get_layer(i) is not None])
+        elif self.can_edit_applied_mask(image_id):
+            prior = image.applied_mask
+            assert prior is not None
+            self.push_undo_checkpoint()
+            # Keep the image's current position and size. Only the mask goes: the unmasked pixels
+            # are cut from the pre-mask image over the area the mask covered, then shown in the
+            # current box.
+            image.source = _unmasked_pixels(
+                prior.base_source,
+                (prior.base_x, prior.base_y, prior.base_w, prior.base_h),
+                (prior.applied_x, prior.applied_y, prior.applied_w, prior.applied_h),
+            )
+            image.source_rect = None
+            image.applied_mask = None
+        else:
+            return False
+        self._on_selection_change(self.selected_layer())
+        self.redraw()
+        return True
+
+    def cancel_mask_edit(self) -> bool:
+        """Leave the mask edit in progress and undo everything it changed. Returns False if none is in progress."""
+        if self.mask_session is None:
+            return False
+        _, depth = self.mask_session
+        self.mask_session = None
+        while len(self._undo_stack) > depth and self.undo():
+            pass
+        self.set_selection([])
+        self.redraw()
+        return True
 
     def add_mask_for_image(self, image: ImageLayer, shape: MaskShape = "circle") -> Optional[MaskLayer]:
         """Create a mask covering the image (or select its existing mask) and select it.
@@ -1694,6 +1630,7 @@ class PosterCanvas(tk.Canvas):
         prior = image.applied_mask
         if prior is not None and self._applied_state_intact(image, prior):
             return None
+        start_depth = len(self._undo_stack)
         self.push_undo_checkpoint()
         mask = MaskLayer(
             target_id=image.id,
@@ -1704,6 +1641,7 @@ class PosterCanvas(tk.Canvas):
             shape=shape,
         )
         self.layers.append(mask)
+        self.mask_session = (mask.id, start_depth)
         self.select_layer(mask.id)
         return mask
 
@@ -1729,16 +1667,20 @@ class PosterCanvas(tk.Canvas):
         image = self.get_layer(image_id)
         assert isinstance(image, ImageLayer) and image.applied_mask is not None
         prior = image.applied_mask
+        start_depth = len(self._undo_stack)
         self.push_undo_checkpoint()
         # Keep any move made since Apply, so the restored image and mask stay where they were.
         dx = image.x - prior.applied_x
         dy = image.y - prior.applied_y
+        # The box stays exactly where it was at click time. The pre-mask pixels are placed
+        # relative to it, so they extend past the box instead of moving the box.
         image.source = prior.base_source
-        image.x = prior.base_x + dx
-        image.y = prior.base_y + dy
-        image.width = prior.base_w
-        image.height = prior.base_h
+        rx, ry, rw, rh = prior.restore_rect or (prior.base_x, prior.base_y, prior.base_w, prior.base_h)
+        image.source_rect = (rx - prior.applied_x, ry - prior.applied_y, rw, rh)
         image.applied_mask = None
+        # Bring the image to the front so the whole restored image is visible while editing.
+        self.layers.remove(image)
+        self.layers.append(image)
         mask = MaskLayer(
             target_id=image.id,
             x=prior.mask_x + dx,
@@ -1747,11 +1689,14 @@ class PosterCanvas(tk.Canvas):
             height=prior.mask_h,
             shape=prior.shape,
             corner_radius=prior.corner_radius,
-            side=prior.side,
+            sides=prior.sides,
             flipped=prior.flipped,
+            peaks=prior.peaks,
+            amplitude=prior.amplitude,
             positioned=True,
         )
         self.layers.append(mask)
+        self.mask_session = (mask.id, start_depth)
         self.select_layer(mask.id)
         return True
 
@@ -1764,33 +1709,37 @@ class PosterCanvas(tk.Canvas):
         if not isinstance(image, ImageLayer):
             return False
 
-        ix1 = max(image.x, mask.x)
-        iy1 = max(image.y, mask.y)
-        ix2 = min(image.x + image.width, mask.x + mask.width)
-        iy2 = min(image.y + image.height, mask.y + mask.height)
+        # Work in the pixels' own rectangle, which can extend past the box after Edit applied mask.
+        px, py, pw, ph = source_page_rect(image)
+        ix1 = max(px, mask.x)
+        iy1 = max(py, mask.y)
+        ix2 = min(px + pw, mask.x + mask.width)
+        iy2 = min(py + ph, mask.y + mask.height)
         if ix2 - ix1 < MIN_LAYER_SIZE or iy2 - iy1 < MIN_LAYER_SIZE:
             return False
 
         sw, sh = image.source.width, image.source.height
-        if sw < 1 or sh < 1 or image.width < 1 or image.height < 1:
+        if sw < 1 or sh < 1 or pw < 1 or ph < 1:
             return False
-        scale_x = sw / image.width
-        scale_y = sh / image.height
-        sx1 = clamp(round((ix1 - image.x) * scale_x), 0, sw - 1)
-        sy1 = clamp(round((iy1 - image.y) * scale_y), 0, sh - 1)
-        sx2 = clamp(round((ix2 - image.x) * scale_x), sx1 + 1, sw)
-        sy2 = clamp(round((iy2 - image.y) * scale_y), sy1 + 1, sh)
+        scale_x = sw / pw
+        scale_y = sh / ph
+        sx1 = clamp(round((ix1 - px) * scale_x), 0, sw - 1)
+        sy1 = clamp(round((iy1 - py) * scale_y), 0, sh - 1)
+        sx2 = clamp(round((ix2 - px) * scale_x), sx1 + 1, sw)
+        sy2 = clamp(round((iy2 - py) * scale_y), sy1 + 1, sh)
 
+        self.mask_session = None
         cropped = image.source.crop((sx1, sy1, sx2, sy2)).convert("RGBA")
         # Page position of the crop's top-left corner, so the mask lines up with the pixels.
-        origin_x = image.x + sx1 / scale_x
-        origin_y = image.y + sy1 / scale_y
+        origin_x = px + sx1 / scale_x
+        origin_y = py + sy1 / scale_y
         alpha = mask_alpha(cropped.width, cropped.height, mask, origin_x, origin_y, scale_x, scale_y)
         cropped.putalpha(ImageChops.multiply(cropped.split()[3], alpha))
 
         self.push_undo_checkpoint()
-        base = (image.source, image.x, image.y, image.width, image.height)
+        base = (image.source, px, py, pw, ph)
         image.source = cropped
+        image.source_rect = None
         image.x = origin_x
         image.y = origin_y
         image.width = cropped.width / scale_x
@@ -1812,8 +1761,10 @@ class PosterCanvas(tk.Canvas):
             mask_h=mask.height,
             shape=mask.shape,
             corner_radius=mask.corner_radius,
-            side=mask.side,
+            sides=mask.sides,
             flipped=mask.flipped,
+            peaks=mask.peaks,
+            amplitude=mask.amplitude,
         )
         self.layers = [layer for layer in self.layers if layer.id != mask.id]
         self.select_layer(image.id, notify=False)
@@ -1839,6 +1790,7 @@ class PosterCanvas(tk.Canvas):
         if ix2 - ix1 < MIN_LAYER_SIZE or iy2 - iy1 < MIN_LAYER_SIZE:
             return
 
+        flatten_source_rect(layer)
         sw, sh = layer.source.width, layer.source.height
         if sw < 1 or sh < 1 or layer.width < 1 or layer.height < 1:
             return
@@ -1921,12 +1873,25 @@ class PosterCanvas(tk.Canvas):
         """Return the mask layers that clip the given image."""
         return [layer for layer in self.layers if isinstance(layer, MaskLayer) and layer.target_id == image_id]
 
-    def render_to_image(self) -> Image.Image:
-        """Composite the board at full page resolution. Mask layers clip their image; they draw nothing."""
+    def render_to_image(self, *, show_mask_guides: bool = False) -> Image.Image:
+        """Composite the board at full page resolution. Mask layers clip their image; they draw nothing.
+
+        show_mask_guides is for the on-screen preview only: while a mask is selected, its image
+        also appears faintly and unclipped, so the mask can be lined up with it. Exports never use it.
+        """
         base = self.paint_layer.convert("RGBA")
+        editing_targets = {
+            layer.target_id
+            for layer in self.selected_layers()
+            if isinstance(layer, MaskLayer)
+        } if show_mask_guides else set()
 
         for layer in self.layers:
             if isinstance(layer, ImageLayer):
+                if layer.id in editing_targets:
+                    ghost = replace(layer, opacity=layer.opacity * MASK_GUIDE_OPACITY)
+                    faint, gx, gy = compose_image_layer(ghost, None)
+                    base.paste(faint, (gx, gy), faint)
                 composited, ox, oy = compose_image_layer(layer, self.masks_for(layer.id))
                 base.paste(composited, (ox, oy), composited)
             elif isinstance(layer, MaskLayer):
@@ -2216,6 +2181,8 @@ class PosterCanvas(tk.Canvas):
                 x2 = x1 + MIN_LAYER_SIZE
             if y2 - y1 < MIN_LAYER_SIZE:
                 y2 = y1 + MIN_LAYER_SIZE
+            if isinstance(layer, ImageLayer):
+                flatten_source_rect(layer)
             layer.x = x1
             layer.y = y1
             layer.width = x2 - x1
@@ -2353,7 +2320,7 @@ class PosterCanvas(tk.Canvas):
         disp_w = self.page_width * self.zoom
         disp_h = self.page_height * self.zoom
 
-        preview = self.render_to_image()
+        preview = self.render_to_image(show_mask_guides=True)
         preview = preview.resize(
             (max(1, int(disp_w)), max(1, int(disp_h))),
             Image.Resampling.LANCZOS,
@@ -2527,6 +2494,430 @@ def render_print_sheet(
     return sheet
 
 
+# Saved collages: a zip holding manifest.json and one PNG per image.
+PROJECT_EXTENSION = ".mbd"
+PROJECT_FORMAT = "manifestation-board"
+PROJECT_VERSION = 1
+def _project_class(name: str) -> Optional[type]:
+    """The dataclass with this name in this module, or None. Any board part can be saved and loaded this way."""
+    candidate = globals().get(name)
+    if isinstance(candidate, type) and dataclasses.is_dataclass(candidate):
+        return candidate
+    return None
+
+
+def _encode_project_value(value: object, images: list[tuple[str, Image.Image]], names: dict[int, str]) -> object:
+    """Turn a layer field into JSON. Images are written out separately and referenced by name."""
+    if isinstance(value, Image.Image):
+        key = id(value)
+        if key not in names:
+            names[key] = f"images/{len(names)}.png"
+            images.append((names[key], value))
+        return {"__image__": names[key]}
+    if isinstance(value, Path):
+        return {"__path__": str(value)}
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {
+            "__dataclass__": type(value).__name__,
+            "fields": {
+                f.name: _encode_project_value(getattr(value, f.name), images, names)
+                for f in dataclasses.fields(value)
+            },
+        }
+    if isinstance(value, tuple):
+        return [_encode_project_value(item, images, names) for item in value]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    raise TypeError(f"A {type(value).__name__} can't be saved in a collage file.")
+
+
+def _decode_project_value(value: object, archive: zipfile.ZipFile, cache: dict[str, Image.Image]) -> object:
+    if isinstance(value, list):
+        return tuple(_decode_project_value(item, archive, cache) for item in value)
+    if not isinstance(value, dict):
+        return value
+    if "__image__" in value:
+        name = str(value["__image__"])
+        if name not in cache:
+            with archive.open(name) as handle:
+                image = Image.open(io.BytesIO(handle.read()))
+                image.load()
+                cache[name] = image.copy()
+        return cache[name]
+    if "__path__" in value:
+        return Path(str(value["__path__"]))
+    if "__dataclass__" in value:
+        name = str(value["__dataclass__"])
+        cls = _project_class(name)
+        if cls is None or not isinstance(value.get("fields"), dict):
+            raise ValueError(f"This collage uses a board part this version doesn't have ({name}).")
+        known = {f.name for f in dataclasses.fields(cls)}
+        kwargs = {
+            key: _decode_project_value(item, archive, cache)
+            for key, item in value["fields"].items()
+            if key in known
+        }
+        if cls in (MaskLayer, AppliedMask) and "sides" not in kwargs and "side" in value["fields"]:
+            # Collages saved before multi-side edges stored a single side; keep that cut.
+            kwargs["sides"] = (str(value["fields"]["side"]),)
+        return cls(**kwargs)
+    raise ValueError("The collage file has an entry this version doesn't understand.")
+
+
+def save_project_file(
+    path: Path,
+    layers: list[BoardLayer],
+    paint_layer: Image.Image,
+    page_width: int,
+    page_height: int,
+    page_bg: str,
+) -> None:
+    """Write the board to a .mbd file. The file is written beside the target and then moved into place."""
+    images: list[tuple[str, Image.Image]] = []
+    names: dict[int, str] = {}
+    manifest = {
+        "format": PROJECT_FORMAT,
+        "version": PROJECT_VERSION,
+        "page": {"width": int(page_width), "height": int(page_height), "bg": page_bg},
+        "paint_layer": _encode_project_value(paint_layer, images, names),
+        "layers": [_encode_project_value(layer, images, names) for layer in layers],
+    }
+    tmp = path.with_name(path.name + ".tmp")
+    with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("manifest.json", json.dumps(manifest))
+        for name, image in images:
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            archive.writestr(name, buffer.getvalue())
+    os.replace(tmp, path)
+
+
+def load_project_file(path: Path) -> dict[str, object]:
+    """Read a .mbd file. Raises ValueError with a readable message when it isn't a valid collage."""
+    with zipfile.ZipFile(path) as archive:
+        manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+        if not isinstance(manifest, dict) or manifest.get("format") != PROJECT_FORMAT:
+            raise ValueError("This file isn't a manifestation board collage.")
+        version = manifest.get("version")
+        if not isinstance(version, int) or version > PROJECT_VERSION:
+            raise ValueError("This collage was saved by a newer version of the app.")
+        page = manifest["page"]
+        width, height = int(page["width"]), int(page["height"])
+        if not (MIN_PAGE_SIZE <= width <= MAX_PAGE_SIZE and MIN_PAGE_SIZE <= height <= MAX_PAGE_SIZE):
+            raise ValueError("The page size in this file is out of range.")
+        cache: dict[str, Image.Image] = {}
+        paint = _decode_project_value(manifest["paint_layer"], archive, cache)
+        if not isinstance(paint, Image.Image):
+            raise ValueError("The paint layer in this file is damaged.")
+        layers = [_decode_project_value(entry, archive, cache) for entry in manifest["layers"]]
+    if not all(isinstance(layer, (ImageLayer, MaskLayer, LineLayer, RectLayer, EllipseLayer)) for layer in layers):
+        raise ValueError("The layers in this file are damaged.")
+    return {
+        "page_width": width,
+        "page_height": height,
+        "page_bg": str(page.get("bg", "#ffffff")),
+        "paint_layer": paint.convert("RGB"),
+        "layers": layers,
+    }
+
+
+OPENAI_EDIT_URL = "https://api.openai.com/v1/images/edits"
+AI_DEFAULT_MODEL = "gpt-image-1"
+AI_MAX_INPUT_SIDE = 2048
+AI_TIMEOUT_SECONDS = 300
+
+
+def openai_edit_image(api_key: str, model: str, prompt: str, image: Image.Image) -> Image.Image:
+    """Send image + prompt to the OpenAI image-edit endpoint and return the generated image.
+
+    Raises RuntimeError with a readable message on any failure.
+    """
+    src = image.convert("RGBA")
+    if max(src.size) > AI_MAX_INPUT_SIDE:
+        src.thumbnail((AI_MAX_INPUT_SIDE, AI_MAX_INPUT_SIDE), Image.LANCZOS)
+    buf = io.BytesIO()
+    src.save(buf, format="PNG")
+
+    boundary = uuid.uuid4().hex
+    parts: list[bytes] = []
+    for name, value in (("model", model), ("prompt", prompt), ("size", "auto")):
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode("utf-8"),
+        )
+    parts.append(
+        (
+            f'--{boundary}\r\nContent-Disposition: form-data; name="image"; filename="image.png"\r\n'
+            "Content-Type: image/png\r\n\r\n"
+        ).encode("utf-8")
+        + buf.getvalue()
+        + b"\r\n",
+    )
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    request = urllib.request.Request(
+        OPENAI_EDIT_URL,
+        data=b"".join(parts),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=AI_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = json.loads(exc.read().decode("utf-8")).get("error", {}).get("message", "")
+        except Exception:
+            pass
+        raise RuntimeError(f"OpenAI error {exc.code}: {detail or exc.reason}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"Could not reach OpenAI: {exc}") from exc
+
+    try:
+        item = payload["data"][0]
+        if item.get("b64_json"):
+            raw = base64.b64decode(item["b64_json"])
+        else:
+            with urllib.request.urlopen(item["url"], timeout=AI_TIMEOUT_SECONDS) as response:
+                raw = response.read()
+        return Image.open(io.BytesIO(raw)).convert("RGBA")
+    except Exception as exc:
+        raise RuntimeError(f"Unexpected response from OpenAI: {exc}") from exc
+
+
+class AIChatPane(ttk.Frame):
+    """Foldable chat pane. Each message edits the target image with OpenAI and replaces it."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        get_canvas: Callable[[], "PosterCanvas"],
+        get_palette: Callable[[], dict[str, str]],
+    ) -> None:
+        super().__init__(master)
+        self._get_canvas = get_canvas
+        self._get_palette = get_palette
+        self._target_id: Optional[str] = None
+        self._busy = False
+        self._results: "queue.Queue[tuple[str, object]]" = queue.Queue()
+        settings = load_settings()
+        self._open = False
+
+        self._toggle_btn = ttk.Button(self, text="▸ AI image chat", command=self.toggle)
+        self._toggle_btn.pack(fill=tk.X)
+
+        self._body = ttk.Frame(self, padding=(0, 6, 0, 0))
+        saved_key = str(settings.get("openai_api_key") or "")
+        self._key_var = tk.StringVar(value=saved_key or os.environ.get("OPENAI_API_KEY", ""))
+        self._remember_var = tk.BooleanVar(value=bool(saved_key))
+        self._model_var = tk.StringVar(value=str(settings.get("openai_image_model") or AI_DEFAULT_MODEL))
+        self._status_var = tk.StringVar(value="Right-click an image > Generate with AI…")
+
+        cfg = ttk.Frame(self._body)
+        cfg.pack(fill=tk.X)
+        cfg.columnconfigure(1, weight=1)
+        ttk.Label(cfg, text="API key").grid(row=0, column=0, sticky="w")
+        ttk.Entry(cfg, textvariable=self._key_var, show="•", width=18).grid(row=0, column=1, sticky="ew", pady=1)
+        ttk.Label(cfg, text="Model").grid(row=1, column=0, sticky="w")
+        ttk.Entry(cfg, textvariable=self._model_var, width=18).grid(row=1, column=1, sticky="ew", pady=1)
+        ttk.Checkbutton(
+            cfg,
+            text="Remember key (plain text in settings file)",
+            variable=self._remember_var,
+        ).grid(row=2, column=0, columnspan=2, sticky="w")
+
+        self._target_label = ttk.Label(self._body, text="Target: none", style="Hint.TLabel")
+        self._target_label.pack(anchor="w", pady=(6, 2))
+
+        log_frame = ttk.Frame(self._body)
+        log_frame.pack(fill=tk.BOTH, expand=True)
+        scroll = ttk.Scrollbar(log_frame)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._log = tk.Text(
+            log_frame,
+            height=9,
+            width=28,
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+            yscrollcommand=scroll.set,
+            borderwidth=1,
+            relief=tk.SOLID,
+        )
+        self._log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.config(command=self._log.yview)
+
+        self._prompt = tk.Text(self._body, height=3, width=28, wrap=tk.WORD, borderwidth=1, relief=tk.SOLID)
+        self._prompt.pack(fill=tk.X, pady=(6, 0))
+        self._prompt.bind("<Return>", self._on_return)
+        self._send_btn = ttk.Button(self._body, text="Generate & replace", command=self.send)
+        self._send_btn.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(self._body, textvariable=self._status_var, style="Hint.TLabel", wraplength=220).pack(
+            anchor="w", pady=(4, 0),
+        )
+        self.apply_theme()
+
+    def apply_theme(self) -> None:
+        p = self._get_palette()
+        for widget in (self._log, self._prompt):
+            widget.configure(
+                bg=p["field"], fg=p["fg"], insertbackground=p["fg"], highlightthickness=0,
+            )
+
+    def toggle(self) -> None:
+        self.set_open(not self._open)
+
+    def set_open(self, value: bool) -> None:
+        self._open = value
+        self._toggle_btn.configure(text=("▾ " if value else "▸ ") + "AI image chat")
+        if value:
+            self._body.pack(fill=tk.BOTH, expand=True)
+        else:
+            self._body.pack_forget()
+
+    def set_target(self, layer: ImageLayer) -> None:
+        """Point the chat at an image, unfold the pane and focus the prompt."""
+        if layer.id != self._target_id:
+            self._append("— New target image —")
+        self._target_id = layer.id
+        name = layer.source_path.name if layer.source_path else "image"
+        self._target_label.configure(text=f"Target: {name} ({int(layer.width)}×{int(layer.height)})")
+        self.set_open(True)
+        self._prompt.focus_set()
+
+    def _append(self, text: str) -> None:
+        self._log.configure(state=tk.NORMAL)
+        self._log.insert(tk.END, text + "\n")
+        self._log.see(tk.END)
+        self._log.configure(state=tk.DISABLED)
+
+    def _on_return(self, event: tk.Event) -> Optional[str]:
+        if event.state & SHIFT_MASK:
+            return None  # Shift+Enter inserts a newline
+        self.send()
+        return "break"
+
+    def _target_layer(self) -> Optional[ImageLayer]:
+        for layer in self._get_canvas().layers:
+            if layer.id == self._target_id and isinstance(layer, ImageLayer):
+                return layer
+        return None
+
+    def send(self) -> None:
+        if self._busy:
+            return
+        prompt = self._prompt.get("1.0", tk.END).strip()
+        key = self._key_var.get().strip()
+        layer = self._target_layer()
+        if layer is None:
+            self._status_var.set("Pick a target: right-click an image > Generate with AI…")
+            return
+        if not key:
+            self._status_var.set("Enter your OpenAI API key.")
+            return
+        if not prompt:
+            return
+        model = self._model_var.get().strip() or AI_DEFAULT_MODEL
+        update_settings(
+            openai_api_key=key if self._remember_var.get() else "",
+            openai_image_model=model,
+        )
+        self._append(f"You: {prompt}")
+        self._prompt.delete("1.0", tk.END)
+        self._busy = True
+        self._send_btn.state(["disabled"])
+        self._status_var.set("Generating… this can take a minute.")
+        source = layer.source.copy()
+        layer_id = layer.id
+
+        def work() -> None:
+            try:
+                self._results.put(("ok", (layer_id, openai_edit_image(key, model, prompt, source))))
+            except Exception as exc:  # shown to the user
+                self._results.put(("err", str(exc)))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(150, self._poll)
+
+    def _poll(self) -> None:
+        try:
+            kind, data = self._results.get_nowait()
+        except queue.Empty:
+            self.after(150, self._poll)
+            return
+        self._busy = False
+        self._send_btn.state(["!disabled"])
+        if kind == "err":
+            self._append(f"Error: {data}")
+            self._status_var.set("Failed. Your image was not changed.")
+            return
+        layer_id, image = data  # type: ignore[misc]
+        canvas = self._get_canvas()
+        layer = next((l for l in canvas.layers if l.id == layer_id and isinstance(l, ImageLayer)), None)
+        if layer is None:
+            self._append("The target image was removed; result discarded.")
+            self._status_var.set("Target image no longer exists.")
+            return
+        canvas.push_undo_checkpoint()
+        layer.source = image
+        layer.source_rect = None
+        layer.collage_source = None
+        layer.applied_mask = None
+        # Keep the left edge, top edge and width; follow the new aspect ratio for height.
+        layer.height = max(MIN_LAYER_SIZE, layer.width * image.height / image.width)
+        canvas.redraw()
+        canvas._on_selection_change(canvas.selected_layer())
+        self._append("AI: replaced the image. Undo (Ctrl+Z) restores the original.")
+        self._status_var.set("Done. Send another message to refine the new image.")
+        self.set_target(layer)
+
+
+class HistoryPanel(ttk.LabelFrame):
+    """Lists every saved board state. Click one to return the board to it."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        get_canvas: Callable[[], "PosterCanvas"],
+        **kwargs: object,
+    ) -> None:
+        super().__init__(master, text="History", padding=6, **kwargs)
+        self._get_canvas = get_canvas
+        frame = ttk.Frame(self)
+        frame.pack(fill=tk.X)
+        scroll = ttk.Scrollbar(frame)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._list = tk.Listbox(frame, height=8, width=30, exportselection=False, yscrollcommand=scroll.set)
+        self._list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.config(command=self._list.yview)
+        self._list.bind("<Button-1>", self._on_click)
+        ttk.Label(self, text="Click a step to return to it.", foreground="#555555", wraplength=200).pack(
+            anchor="w", pady=(4, 0),
+        )
+
+    def refresh(self) -> None:
+        """Rebuild the list from the canvas history and mark the current step."""
+        labels, current = self._get_canvas().history_timeline()
+        self._list.delete(0, tk.END)
+        for label in labels:
+            self._list.insert(tk.END, label)
+        self._list.itemconfig(current, foreground="#0078d7")
+        self._list.selection_clear(0, tk.END)
+        self._list.selection_set(current)
+        self._list.see(current)
+
+    def _on_click(self, event: tk.Event) -> str:
+        index = self._list.nearest(event.y)
+        bbox = self._list.bbox(index)
+        if bbox is None or not bbox[1] <= event.y < bbox[1] + bbox[3]:
+            return "break"
+        if not self._get_canvas().jump_to_history(index):
+            self.bell()
+        self.refresh()
+        return "break"
+
+
 class ResizePanel(ttk.LabelFrame):
     """Resize the selected images on the board, by typed size or by a percent of their original size."""
 
@@ -2563,14 +2954,31 @@ class ResizePanel(ttk.LabelFrame):
             button = ttk.Button(percent_row, text=level)
             button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
             self._percent_buttons[level] = button
+        reset_row = ttk.Frame(self)
+        reset_row.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        ttk.Label(reset_row, text="Reset to").pack(side=tk.LEFT)
+        self._reset_var = tk.StringVar(value="100% (original)")
+        self._reset_combo = ttk.Combobox(reset_row, textvariable=self._reset_var, state="readonly", width=16)
+        self._reset_combo.pack(side=tk.LEFT, padx=4)
+        ttk.Button(reset_row, text="Reset", command=self.reset_selected).pack(side=tk.LEFT)
         self.refresh_percents()
 
     def refresh_percents(self) -> None:
-        """Show the saved Low, Medium and High percents on the buttons."""
+        """Show the saved Low, Medium and High percents on the buttons and in the Reset list."""
         percents = load_importance_percent()
         for level, button in self._percent_buttons.items():
             percent = percents[level]
             button.configure(text=f"{level} {percent}%", command=lambda p=percent: self.scale_percent(p))
+        self._reset_choices: dict[str, int] = {"100% (original)": 100}
+        for level, percent in percents.items():
+            self._reset_choices[f"{level} {percent}%"] = percent
+        self._reset_combo.configure(values=list(self._reset_choices))
+        if self._reset_var.get() not in self._reset_choices:
+            self._reset_var.set("100% (original)")
+
+    def reset_selected(self) -> None:
+        """Set the selected images to the percent chosen in Reset to (100% or any preset)."""
+        self.scale_percent(self._reset_choices.get(self._reset_var.get(), 100))
 
     def _selected_images(self) -> list[ImageLayer]:
         canvas = self._get_canvas()
@@ -2611,6 +3019,7 @@ class ResizePanel(ttk.LabelFrame):
         canvas = self._get_canvas()
         canvas.push_undo_checkpoint()
         for layer in images:
+            flatten_source_rect(layer)
             if height is None:
                 ratio = layer.width / layer.height if layer.height > 0 else 1.0
                 layer.width = float(width)
@@ -2631,6 +3040,7 @@ class ResizePanel(ttk.LabelFrame):
         canvas.push_undo_checkpoint()
         scale = percent / 100
         for layer in images:
+            flatten_source_rect(layer)
             layer.width = max(MIN_LAYER_SIZE, layer.source.width * scale)
             layer.height = max(MIN_LAYER_SIZE, layer.source.height * scale)
         self._refresh_board(images)
@@ -2652,6 +3062,13 @@ class ManifestationBoardApp(tk.Tk):
         self.canvas.keep_aspect_on_resize = self._keep_aspect_resize.get()
         self._build_menubar()
         self._install_edit_shortcuts()
+        self._project_path: Optional[Path] = None
+        self._saved_marker: Optional[tuple[int, int, int]] = None
+        self.after_idle(self._mark_saved)
+        self.protocol("WM_DELETE_WINDOW", self._exit_app)
+        self.bind_all("<Control-o>", lambda _e: self._project_open())
+        self.bind_all("<Control-s>", lambda _e: self._project_save())
+        self.bind_all("<Control-Shift-S>", lambda _e: self._project_save_as())
         self._apply_theme()
 
     def _on_keep_aspect_resize_toggled(self) -> None:
@@ -2684,6 +3101,8 @@ class ManifestationBoardApp(tk.Tk):
             foreground=[("selected", p["select_fg"])],
         )
         self.configure(bg=p["root"])
+        if hasattr(self, "_ai_pane"):
+            self._ai_pane.apply_theme()
         self.option_add("*TCombobox*Listbox.background", p["field"])
         self.option_add("*TCombobox*Listbox.foreground", p["fg"])
         self.option_add("*TCombobox*Listbox.selectBackground", p["select"])
@@ -2696,12 +3115,15 @@ class ManifestationBoardApp(tk.Tk):
         file_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="File", menu=file_menu)
         file_menu.add_command(label="New board…", command=self._new_board)
+        file_menu.add_command(label="Open collage…", command=self._project_open, accelerator="Ctrl+O")
+        file_menu.add_command(label="Save collage", command=self._project_save, accelerator="Ctrl+S")
+        file_menu.add_command(label="Save collage as…", command=self._project_save_as, accelerator="Ctrl+Shift+S")
         file_menu.add_command(label="Import images to board…", command=self._import_to_board)
         file_menu.add_separator()
         file_menu.add_command(label="Export board as image…", command=self._export_board)
         file_menu.add_command(label="Export print tiles (multi-page PDF)…", command=self._export_print_tiles)
         file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.destroy)
+        file_menu.add_command(label="Exit", command=self._exit_app)
 
         edit_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Edit", menu=edit_menu)
@@ -2853,15 +3275,8 @@ class ManifestationBoardApp(tk.Tk):
     def _build_layout(self) -> None:
         navbar = ttk.Frame(self, padding=(8, 6))
         navbar.pack(fill=tk.X)
-        ttk.Label(navbar, text="Manifestation Board", font=("Segoe UI", 12, "bold")).pack(
-            side=tk.LEFT,
-        )
-        ttk.Button(navbar, text="Page settings", command=self._page_settings_dialog).pack(
-            side=tk.RIGHT,
-            padx=4,
-        )
-        ttk.Button(navbar, text="Export image", command=self._export_board).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(navbar, text="Import images", command=self._import_to_board).pack(side=tk.RIGHT)
+        ttk.Button(navbar, text="Import images", command=self._import_to_board).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(navbar, text="Export image", command=self._export_board).pack(side=tk.LEFT, padx=4)
         ttk.Button(navbar, text="Arrange images…", command=self._arrange_images).pack(side=tk.RIGHT, padx=4)
         ttk.Button(navbar, text="Make collage…", command=self._make_collage).pack(side=tk.RIGHT, padx=4)
 
@@ -2945,6 +3360,9 @@ class ManifestationBoardApp(tk.Tk):
         tol_spin.bind("<FocusOut>", self._sync_fill_tol)
         tol_spin.bind("<Return>", self._sync_fill_tol)
 
+        history_panel = HistoryPanel(left, get_canvas=lambda: self.canvas)
+        self._history_panel = history_panel
+        history_panel.pack(fill=tk.X, pady=(0, 8))
         resize_panel = ResizePanel(left, get_canvas=lambda: self.canvas)
         self._resize_panel = resize_panel
         resize_panel.pack(fill=tk.X, pady=(0, 8))
@@ -2959,22 +3377,46 @@ class ManifestationBoardApp(tk.Tk):
 
         self.canvas = PosterCanvas(center, on_selection_change=self._on_selection_changed)
         self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.canvas.set_history_listener(self._history_panel.refresh)
+        self._history_panel.refresh()
         self._refresh_stroke_ui()
         self._refresh_page_info()
 
         right = ttk.Frame(body, width=260)
         body.add(right, weight=0)
+        # Packed first at the bottom so it keeps its space when unfolded.
+        self._ai_pane = AIChatPane(right, get_canvas=lambda: self.canvas, get_palette=self._current_palette)
+        self._ai_pane.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+        self.canvas.on_ai_edit = self._ai_pane.set_target
         self._props_notebook = ttk.Notebook(right)
-        self._props_notebook.pack(fill=tk.BOTH, expand=True)
+        self._props_notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         page_tab = ttk.Frame(self._props_notebook, padding=8)
         self._props_notebook.add(page_tab, text="Page")
-        ttk.Label(page_tab, text="Width (px)").grid(row=0, column=0, sticky="w")
+        self._page_unit_var = tk.StringVar(value="px")
+        self._page_unit_last = "px"
+        self._page_dpi_var = tk.StringVar(value="150")
+        self._page_w_label = ttk.Label(page_tab, text="Width (px)")
+        self._page_w_label.grid(row=0, column=0, sticky="w")
         self._page_w_var = tk.StringVar(value=str(self.canvas.page_width))
         ttk.Entry(page_tab, textvariable=self._page_w_var, width=10).grid(row=0, column=1, pady=2)
-        ttk.Label(page_tab, text="Height (px)").grid(row=1, column=0, sticky="w")
+        self._page_h_label = ttk.Label(page_tab, text="Height (px)")
+        self._page_h_label.grid(row=1, column=0, sticky="w")
         self._page_h_var = tk.StringVar(value=str(self.canvas.page_height))
         ttk.Entry(page_tab, textvariable=self._page_h_var, width=10).grid(row=1, column=1, pady=2)
+        ttk.Label(page_tab, text="Units").grid(row=7, column=0, sticky="w", pady=(8, 0))
+        unit_row = ttk.Frame(page_tab)
+        unit_row.grid(row=7, column=1, sticky="w", pady=(8, 0))
+        for label, value in (("Pixels", "px"), ("Inches", "in")):
+            ttk.Radiobutton(
+                unit_row,
+                text=label,
+                value=value,
+                variable=self._page_unit_var,
+                command=self._on_page_unit_changed,
+            ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(page_tab, text="DPI (inches)").grid(row=8, column=0, sticky="w")
+        ttk.Entry(page_tab, textvariable=self._page_dpi_var, width=10).grid(row=8, column=1, pady=2, sticky="w")
         self._landscape_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             page_tab,
@@ -2996,6 +3438,9 @@ class ManifestationBoardApp(tk.Tk):
         self._preset_combo = preset
         preset_buttons = ttk.Frame(page_tab)
         preset_buttons.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(page_tab, text="Set as default page", command=self._set_default_page).grid(
+            row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0)
+        )
         ttk.Button(preset_buttons, text="Save size as preset…", command=self._save_page_preset).pack(
             side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2)
         )
@@ -3090,11 +3535,53 @@ class ManifestationBoardApp(tk.Tk):
         self._align_ref_combos: list[ttk.Combobox] = []
         self._build_align_controls(image_tab, grid_row=11)
 
+        effects_tab = ttk.Frame(self._props_notebook, padding=8)
+        self._props_notebook.add(effects_tab, text="Effects")
+        self._fx_shadow_var = tk.BooleanVar(value=False)
+        self._fx_shadow_offset_var = tk.StringVar(value="12")
+        self._fx_shadow_blur_var = tk.StringVar(value="10")
+        self._fx_shadow_opacity_var = tk.StringVar(value="60")
+        self._fx_shadow_color_var = tk.StringVar(value="#000000")
+        self._fx_bevel_var = tk.BooleanVar(value=False)
+        self._fx_bevel_size_var = tk.StringVar(value="6")
+        self._fx_emboss_var = tk.BooleanVar(value=False)
+        self._fx_emboss_strength_var = tk.StringVar(value="60")
+        ttk.Checkbutton(effects_tab, text="Background shadow", variable=self._fx_shadow_var).grid(
+            row=0, column=0, columnspan=2, sticky="w"
+        )
+        ttk.Label(effects_tab, text="Offset px").grid(row=1, column=0, sticky="w")
+        ttk.Entry(effects_tab, textvariable=self._fx_shadow_offset_var, width=10).grid(row=1, column=1, pady=2)
+        ttk.Label(effects_tab, text="Blur px").grid(row=2, column=0, sticky="w")
+        ttk.Entry(effects_tab, textvariable=self._fx_shadow_blur_var, width=10).grid(row=2, column=1, pady=2)
+        ttk.Label(effects_tab, text="Opacity %").grid(row=3, column=0, sticky="w")
+        ttk.Entry(effects_tab, textvariable=self._fx_shadow_opacity_var, width=10).grid(row=3, column=1, pady=2)
+        ttk.Label(effects_tab, text="Shadow color").grid(row=4, column=0, sticky="w")
+        ttk.Entry(effects_tab, textvariable=self._fx_shadow_color_var, width=10).grid(row=4, column=1, pady=2)
+        ttk.Checkbutton(effects_tab, text="Bevel (light top-left, shade bottom-right)", variable=self._fx_bevel_var).grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
+        ttk.Label(effects_tab, text="Bevel size px").grid(row=6, column=0, sticky="w")
+        ttk.Entry(effects_tab, textvariable=self._fx_bevel_size_var, width=10).grid(row=6, column=1, pady=2)
+        ttk.Checkbutton(effects_tab, text="Emboss", variable=self._fx_emboss_var).grid(
+            row=7, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
+        ttk.Label(effects_tab, text="Strength %").grid(row=8, column=0, sticky="w")
+        ttk.Entry(effects_tab, textvariable=self._fx_emboss_strength_var, width=10).grid(row=8, column=1, pady=2)
+        ttk.Button(effects_tab, text="Apply to selected", command=self._apply_effects_props).grid(
+            row=9, column=0, columnspan=2, sticky="ew", pady=(12, 0)
+        )
+        ttk.Label(
+            effects_tab,
+            text="The shadow sits outside the image's box, so it is not part of the selection outline.",
+            wraplength=220,
+            style="Hint.TLabel",
+        ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
         shape_tab = ttk.Frame(self._props_notebook, padding=8)
         self._props_notebook.add(shape_tab, text="Shape")
         ttk.Label(
             shape_tab,
-            text="Select a line or shape, then change its stroke color and width in the Stroke panel on the left. Changes apply immediately.",
+            text="Select lines, shapes or images, then change their stroke color and width in the Stroke panel on the left. Changes apply to every selected item immediately.",
             wraplength=220,
         ).pack(anchor="w", pady=(0, 8))
         self._build_align_controls(shape_tab, use_pack=True)
@@ -3133,6 +3620,8 @@ class ManifestationBoardApp(tk.Tk):
             "edge_zigzag": "Zigzag",
             "edge_scallop": "Scallop",
             "edge_arc": "Arc",
+            "dollar": "Dollar $",
+            "frame": "Border",
         }
         for index, key in enumerate(MASK_SHAPE_LABELS):
             ttk.Radiobutton(
@@ -3157,17 +3646,18 @@ class ManifestationBoardApp(tk.Tk):
             variable=self._mask_radius_var,
             length=120,
         ).pack(side=tk.RIGHT, padx=6)
-        edge_frame = ttk.LabelFrame(mask_tab, text="Edge side", padding=4)
+        edge_frame = ttk.LabelFrame(mask_tab, text="Edge sides", padding=4)
         edge_frame.pack(fill=tk.X, pady=(6, 0))
-        self._mask_side_var = tk.StringVar(value="bottom")
+        self._mask_side_vars: dict[EdgeSide, tk.BooleanVar] = {
+            key: tk.BooleanVar(value=key == "bottom") for key in EDGE_SIDE_LABELS
+        }
         self._mask_flip_var = tk.BooleanVar(value=False)
         self._edge_widgets: list[ttk.Widget] = []
         for index, (key, label) in enumerate(EDGE_SIDE_LABELS.items()):
-            button = ttk.Radiobutton(
+            button = ttk.Checkbutton(
                 edge_frame,
                 text=label,
-                value=key,
-                variable=self._mask_side_var,
+                variable=self._mask_side_vars[key],
                 command=self._on_edge_option_changed,
             )
             button.grid(row=index // 2, column=index % 2, sticky="w", padx=4, pady=2)
@@ -3180,8 +3670,23 @@ class ManifestationBoardApp(tk.Tk):
         )
         flip.grid(row=2, column=0, columnspan=2, sticky="w", padx=4, pady=(4, 0))
         self._edge_widgets.append(flip)
+        self._mask_peaks_var = tk.StringVar(value="")
+        self._mask_amp_var = tk.StringVar(value="")
+        for row, (label, var) in enumerate((("Peaks per side", self._mask_peaks_var), ("Peak height (px)", self._mask_amp_var))):
+            ttk.Label(edge_frame, text=label).grid(row=3 + row, column=0, sticky="w", padx=4, pady=(4, 0))
+            entry = ttk.Spinbox(edge_frame, from_=0, to=500, width=6, textvariable=var, command=self._on_edge_option_changed)
+            entry.grid(row=3 + row, column=1, sticky="w", padx=4, pady=(4, 0))
+            entry.bind("<Return>", lambda _e: self._on_edge_option_changed())
+            entry.bind("<FocusOut>", lambda _e: self._on_edge_option_changed())
+            self._edge_widgets.append(entry)
+        ttk.Label(edge_frame, text="0 = default", style="Hint.TLabel").grid(
+            row=5, column=0, columnspan=2, sticky="w", padx=4
+        )
         self._apply_mask_btn = ttk.Button(mask_tab, text="Apply mask", command=self._apply_mask)
         self._apply_mask_btn.pack(fill=tk.X, pady=(14, 0))
+        self._cancel_mask_btn = ttk.Button(mask_tab, text="Cancel mask edit", command=self._cancel_mask_edit)
+        self._cancel_mask_btn.pack(fill=tk.X, pady=(4, 0))
+        self._cancel_mask_btn.state(["disabled"])
         self._apply_mask_btn.state(["disabled"])
         ttk.Label(
             mask_tab,
@@ -3350,6 +3855,33 @@ class ManifestationBoardApp(tk.Tk):
         ttk.Label(frame, text="Gap between images (px):").grid(row=1, column=0, sticky="w", pady=4)
         gap_entry = ttk.Entry(frame, textvariable=gap_var, width=10)
         gap_entry.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=4)
+        resize_var = tk.BooleanVar(value=bool(settings.get("arrange_resize", True)))
+        ttk.Checkbutton(
+            frame,
+            text="Resize images to fill the page",
+            variable=resize_var,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(
+            frame,
+            text="Off: images keep their current size and are placed in rows.",
+            style="Hint.TLabel",
+        ).grid(row=3, column=0, columnspan=2, sticky="w")
+        overlap_on_var = tk.BooleanVar(value=bool(settings.get("arrange_allow_overlap", False)))
+        overlap_var = tk.StringVar(value=str(settings.get("arrange_overlap", 20)))
+        overlap_entry = ttk.Entry(frame, textvariable=overlap_var, width=10)
+        overlap_entry.grid(row=5, column=1, sticky="w", padx=(8, 0), pady=4)
+        overlap_entry.state(["!disabled"] if overlap_on_var.get() else ["disabled"])
+
+        def toggle_overlap() -> None:
+            overlap_entry.state(["!disabled"] if overlap_on_var.get() else ["disabled"])
+
+        ttk.Checkbutton(
+            frame,
+            text="Allow overlap",
+            variable=overlap_on_var,
+            command=toggle_overlap,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(frame, text="Overlap (px):").grid(row=5, column=0, sticky="w", pady=4)
 
         def confirm() -> None:
             try:
@@ -3365,6 +3897,20 @@ class ManifestationBoardApp(tk.Tk):
                     parent=dialog,
                 )
                 return
+            layout_gap = gap
+            if overlap_on_var.get():
+                try:
+                    overlap = int(overlap_var.get().strip())
+                except ValueError:
+                    messagebox.showerror("Arrange images", "Overlap must be a whole number.", parent=dialog)
+                    return
+                if not 0 <= overlap <= ARRANGE_MAX_GAP:
+                    messagebox.showerror(
+                        "Arrange images", f"Overlap must be 0–{ARRANGE_MAX_GAP} px.", parent=dialog
+                    )
+                    return
+                # A negative gap makes neighbouring images overlap by that many pixels.
+                layout_gap = -overlap
             if 2 * margin >= min(self.canvas.page_width, self.canvas.page_height):
                 messagebox.showerror(
                     "Arrange images",
@@ -3372,12 +3918,33 @@ class ManifestationBoardApp(tk.Tk):
                     parent=dialog,
                 )
                 return
-            update_settings(arrange_margin=margin, arrange_gap=gap)
+            resize = resize_var.get()
+            if not resize:
+                movable = [l for l in self.canvas.layers if isinstance(l, ImageLayer) and not l.user_placed]
+                sizes = [
+                    (l.width + 2 * max(0, l.border_width), l.height + 2 * max(0, l.border_width)) for l in movable
+                ]
+                _pos, fits = compute_shelf_layout(
+                    sizes, self.canvas.page_width, self.canvas.page_height, margin, layout_gap,
+                )
+                if not fits and not messagebox.askyesno(
+                    "Arrange images",
+                    "At their current sizes the images don't fit on the page. Arrange anyway?",
+                    parent=dialog,
+                ):
+                    return
+            update_settings(
+                arrange_margin=margin,
+                arrange_gap=gap,
+                arrange_resize=resize,
+                arrange_allow_overlap=bool(overlap_on_var.get()),
+                arrange_overlap=overlap_var.get().strip(),
+            )
             dialog.destroy()
-            self.canvas.arrange_images(margin=margin, gap=gap)
+            self.canvas.arrange_images(margin=margin, gap=layout_gap, resize=resize)
 
         buttons = ttk.Frame(frame)
-        buttons.grid(row=2, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        buttons.grid(row=6, column=0, columnspan=2, sticky="e", pady=(12, 0))
         ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT)
         ttk.Button(buttons, text="Arrange", command=confirm).pack(side=tk.RIGHT, padx=(0, 6))
         dialog.bind("<Return>", lambda _e: confirm())
@@ -3386,8 +3953,9 @@ class ManifestationBoardApp(tk.Tk):
         dialog.grab_set()
 
     def _make_collage(self) -> None:
-        """Pick a mask shape, then fill the page with every image."""
-        if not any(isinstance(layer, ImageLayer) for layer in self.canvas.layers):
+        """Choose the defaults, then set resize, mask and stroke for each image before filling the page."""
+        images = [layer for layer in self.canvas.layers if isinstance(layer, ImageLayer)]
+        if not images:
             messagebox.showinfo("Make Collage", "Add at least one image to the board first.")
             return
 
@@ -3409,18 +3977,18 @@ class ManifestationBoardApp(tk.Tk):
         frame = ttk.Frame(dialog, padding=12)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(frame, text="Mask shape:").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Label(frame, text="Default mask shape:").grid(row=0, column=0, sticky="w", pady=4)
         combo = ttk.Combobox(frame, textvariable=choice_var, values=labels, state="readonly", width=24)
         combo.grid(row=0, column=1, sticky="w", padx=(8, 0), pady=4)
         ttk.Label(frame, text="Max overlap (%):").grid(row=1, column=0, sticky="w", pady=4)
         ttk.Spinbox(frame, from_=0, to=100, textvariable=overlap_var, width=8).grid(
             row=1, column=1, sticky="w", padx=(8, 0), pady=4
         )
-        ttk.Label(frame, text="Stroke width (px):").grid(row=2, column=0, sticky="w", pady=4)
-        ttk.Spinbox(frame, from_=0, to=50, textvariable=stroke_var, width=8).grid(
+        ttk.Label(frame, text="Default stroke width (px):").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Spinbox(frame, from_=0, to=COLLAGE_MAX_STROKE, textvariable=stroke_var, width=8).grid(
             row=2, column=1, sticky="w", padx=(8, 0), pady=4
         )
-        ttk.Label(frame, text="Stroke color:").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Label(frame, text="Default stroke color:").grid(row=3, column=0, sticky="w", pady=4)
         color_row = ttk.Frame(frame)
         color_row.grid(row=3, column=1, sticky="w", padx=(8, 0), pady=4)
         ttk.Entry(color_row, textvariable=color_var, width=10).pack(side=tk.LEFT)
@@ -3435,13 +4003,82 @@ class ManifestationBoardApp(tk.Tk):
         ttk.Spinbox(frame, from_=0, to=COLLAGE_MAX_CORNER_PCT, textvariable=corner_var, width=8).grid(
             row=4, column=1, sticky="w", padx=(8, 0), pady=4
         )
-        ttk.Label(
-            frame,
-            text="Every image is cropped to fill the page. Images overlap only where needed\n"
-            "to cover the gaps left by the mask, up to the max overlap. Corner radius "
-            "applies to the Rounded shape.",
-            justify=tk.LEFT,
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        # Per-image list: thumbnail, resize %, mask, stroke width and colour.
+        rows: list[dict[str, object]] = []
+        thumbs: list[ImageTk.PhotoImage] = []
+
+        def pick_row_color(var: tk.StringVar) -> None:
+            chosen = colorchooser.askcolor(color=var.get(), title="Stroke color", parent=dialog)
+            if chosen[1]:
+                var.set(chosen[1])
+
+        def copy_defaults() -> None:
+            for row in rows:
+                row["shape"].set(choice_var.get())  # type: ignore[union-attr]
+                row["stroke"].set(stroke_var.get())  # type: ignore[union-attr]
+                row["color"].set(color_var.get())  # type: ignore[union-attr]
+
+        def randomize_colors() -> None:
+            for row in rows:
+                row["color"].set(random_stroke_color())  # type: ignore[union-attr]
+
+        def randomize_masks() -> None:
+            # Every shape except "None", so each image gets a visible mask.
+            choices = [MASK_SHAPE_LABELS[key] for key in MASK_SHAPE_LABELS if key != "none"]
+            for row in rows:
+                row["shape"].set(random.choice(choices))  # type: ignore[union-attr]
+
+        row_buttons = ttk.Frame(frame)
+        row_buttons.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(row_buttons, text="Copy defaults to every image", command=copy_defaults).pack(side=tk.LEFT)
+        ttk.Button(row_buttons, text="Randomize colors", command=randomize_colors).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(row_buttons, text="Randomize masks", command=randomize_masks).pack(side=tk.LEFT, padx=(6, 0))
+        box = ttk.LabelFrame(frame, text="Images: size % of each image's set size, mask and stroke", padding=6)
+        box.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
+        list_canvas = tk.Canvas(box, width=640, height=300, highlightthickness=0, bg=self._current_palette()["field"])
+        scroll = ttk.Scrollbar(box, orient=tk.VERTICAL, command=list_canvas.yview)
+        inner = ttk.Frame(list_canvas)
+        inner.bind("<Configure>", lambda _e: list_canvas.configure(scrollregion=list_canvas.bbox("all")))
+        list_canvas.create_window((0, 0), window=inner, anchor="nw")
+        list_canvas.configure(yscrollcommand=scroll.set)
+        list_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        for column, title in enumerate(("", "Image", "Size %", "Mask", "Stroke px", "Color", "")):
+            ttk.Label(inner, text=title).grid(row=0, column=column, sticky="w", padx=4, pady=(0, 4))
+        for index, layer in enumerate(images, start=1):
+            thumb = _collage_base(layer).convert("RGBA").copy()
+            thumb.thumbnail((56, 56))
+            photo = ImageTk.PhotoImage(thumb)
+            thumbs.append(photo)
+            ttk.Label(inner, image=photo).grid(row=index, column=0, padx=4, pady=3)
+            name = layer.source_path.name if layer.source_path else f"Image {index}"
+            ttk.Label(inner, text=name, width=18).grid(row=index, column=1, sticky="w", padx=4)
+            percent_var = tk.StringVar(value="100")
+            ttk.Entry(inner, textvariable=percent_var, width=7).grid(row=index, column=2, padx=4)
+            shape_var = tk.StringVar(value=choice_var.get())
+            ttk.Combobox(inner, textvariable=shape_var, values=labels, state="readonly", width=16).grid(
+                row=index, column=3, padx=4
+            )
+            row_stroke_var = tk.StringVar(value=stroke_var.get())
+            ttk.Spinbox(inner, from_=0, to=COLLAGE_MAX_STROKE, textvariable=row_stroke_var, width=5).grid(
+                row=index, column=4, padx=4
+            )
+            row_color_var = tk.StringVar(value=color_var.get())
+            ttk.Entry(inner, textvariable=row_color_var, width=9).grid(row=index, column=5, padx=4)
+            ttk.Button(inner, text="Pick…", command=lambda v=row_color_var: pick_row_color(v)).grid(
+                row=index, column=6, padx=(2, 4)
+            )
+            rows.append(
+                {
+                    "layer": layer,
+                    "percent": percent_var,
+                    "shape": shape_var,
+                    "stroke": row_stroke_var,
+                    "color": row_color_var,
+                }
+            )
 
         def confirm() -> None:
             label = choice_var.get()
@@ -3472,9 +4109,40 @@ class ManifestationBoardApp(tk.Tk):
                 )
                 return
             color = color_var.get().strip()
-            if len(color) != 7 or not color.startswith("#") or any(ch not in "0123456789abcdefABCDEF" for ch in color[1:]):
+            if not _is_hex_color(color):
                 messagebox.showerror("Make Collage", "Stroke color must look like #rrggbb.", parent=dialog)
                 return
+
+            items: dict[str, CollageItemOptions] = {}
+            for row in rows:
+                name = str(row["layer"].source_path.name if row["layer"].source_path else "an image")  # type: ignore[union-attr]
+                try:
+                    percent = float(str(row["percent"].get()).strip())  # type: ignore[union-attr]
+                    row_stroke = int(str(row["stroke"].get()).strip())  # type: ignore[union-attr]
+                except ValueError:
+                    messagebox.showerror("Make Collage", f"Check the resize % and stroke for {name}.", parent=dialog)
+                    return
+                if not 1 <= percent <= 400:
+                    messagebox.showerror("Make Collage", f"Resize % for {name} must be 1–400.", parent=dialog)
+                    return
+                if not 0 <= row_stroke <= COLLAGE_MAX_STROKE:
+                    messagebox.showerror(
+                        "Make Collage", f"Stroke for {name} must be 0–{COLLAGE_MAX_STROKE} px.", parent=dialog
+                    )
+                    return
+                row_color = str(row["color"].get()).strip()  # type: ignore[union-attr]
+                if not _is_hex_color(row_color):
+                    messagebox.showerror("Make Collage", f"Color for {name} must look like #rrggbb.", parent=dialog)
+                    return
+                row_label = str(row["shape"].get())  # type: ignore[union-attr]
+                row_shape = keys[labels.index(row_label)] if row_label in labels else shape
+                items[row["layer"].id] = CollageItemOptions(  # type: ignore[union-attr]
+                    percent=percent,
+                    shape=row_shape,
+                    stroke_width=row_stroke,
+                    stroke_color=row_color,
+                )
+
             update_settings(
                 collage_shape=shape,
                 collage_overlap=overlap_pct,
@@ -3489,6 +4157,7 @@ class ManifestationBoardApp(tk.Tk):
                 corner_fraction=corner_pct / 100,
                 stroke_width=stroke,
                 stroke_color=color,
+                items=items,
             )
             if result is None:
                 return
@@ -3499,10 +4168,9 @@ class ManifestationBoardApp(tk.Tk):
             )
 
         buttons = ttk.Frame(frame)
-        buttons.grid(row=6, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        buttons.grid(row=7, column=0, columnspan=2, sticky="e", pady=(12, 0))
         ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT)
         ttk.Button(buttons, text="Make collage", command=confirm).pack(side=tk.RIGHT, padx=(0, 6))
-        dialog.bind("<Return>", lambda _e: confirm())
         dialog.bind("<Escape>", lambda _e: dialog.destroy())
         combo.focus_set()
         dialog.grab_set()
@@ -3532,12 +4200,23 @@ class ManifestationBoardApp(tk.Tk):
             preview.configure(bg=color, fg=text)
 
     def _refresh_stroke_ui(self) -> None:
-        """Show the selected shape's stroke (or the defaults) in the Stroke panel."""
+        """Show the selected layer's stroke (or the defaults) in the Stroke panel."""
         _, width = self.canvas.displayed_stroke()
         self._stroke_width_var.set(width)
-        self._stroke_scale.set(width)
+        # Setting the slider fires its change handler, which would push this width onto the
+        # selection. Silence it while the panel just shows the current selection.
+        self._stroke_refreshing = True
+        try:
+            self._stroke_scale.set(width)
+        finally:
+            self._stroke_refreshing = False
         self._update_color_previews()
         self._draw_stroke_sample()
+        targets = self.canvas._stroke_targets()
+        if targets and isinstance(targets[0], ImageLayer):
+            # Keep the Image tab's border fields in step with the stroke panel.
+            self._img_border_var.set(str(targets[0].border_width))
+            self._img_border_color_var.set(targets[0].border_color)
 
     def _draw_stroke_sample(self) -> None:
         color, width = self.canvas.displayed_stroke()
@@ -3560,6 +4239,8 @@ class ManifestationBoardApp(tk.Tk):
             return None
 
     def _on_stroke_scale(self, value: str) -> None:
+        if getattr(self, "_stroke_refreshing", False):
+            return
         width = max(1, min(48, round(float(value))))
         self._stroke_width_var.set(width)
         undo = not self._stroke_drag_active
@@ -3602,12 +4283,25 @@ class ManifestationBoardApp(tk.Tk):
             self._img_border_var.set(str(layer.border_width))
             self._img_border_color_var.set(layer.border_color)
             self._img_stroke_after_var.set(layer.stroke_after_mask)
+            fx = layer.effects
+            self._fx_shadow_var.set(fx.shadow)
+            self._fx_shadow_offset_var.set(str(fx.shadow_offset))
+            self._fx_shadow_blur_var.set(str(fx.shadow_blur))
+            self._fx_shadow_opacity_var.set(str(round(fx.shadow_opacity * 100)))
+            self._fx_shadow_color_var.set(fx.shadow_color)
+            self._fx_bevel_var.set(fx.bevel)
+            self._fx_bevel_size_var.set(str(fx.bevel_size))
+            self._fx_emboss_var.set(fx.emboss)
+            self._fx_emboss_strength_var.set(str(round(fx.emboss_strength * 100)))
         elif isinstance(layer, MaskLayer):
             self._props_notebook.select(self._mask_tab)
             self._mask_shape_var.set(layer.shape)
             self._mask_radius_var.set(float(layer.corner_radius))
-            self._mask_side_var.set(layer.side)
+            for key, var in self._mask_side_vars.items():
+                var.set(key in layer.sides)
             self._mask_flip_var.set(layer.flipped)
+            self._mask_peaks_var.set(str(layer.peaks))
+            self._mask_amp_var.set(str(layer.amplitude))
             target = self.canvas.get_layer(layer.target_id)
             name = target.source_path.name if isinstance(target, ImageLayer) and target.source_path else "image"
             ready = layer.positioned
@@ -3620,6 +4314,7 @@ class ManifestationBoardApp(tk.Tk):
             self._mask_info_var.set("Select a mask on the board.")
             self._apply_mask_btn.state(["disabled"])
         self._update_edge_controls()
+        self._refresh_mask_cancel_button()
         self._updating_props = False
         self._refresh_stroke_ui()
         self._refresh_align_reference_choices()
@@ -3683,19 +4378,26 @@ class ManifestationBoardApp(tk.Tk):
             widget.state(["!disabled"] if usable else ["disabled"])
 
     def _on_edge_option_changed(self) -> None:
-        """Apply the chosen side or flip to the selected edge mask."""
+        """Apply the chosen sides or flip to the selected edge mask."""
         if self._updating_props:
             return
         layer = self.canvas.selected_layer()
         if not isinstance(layer, MaskLayer) or layer.shape not in EDGE_SHAPES:
             return
-        side = self._mask_side_var.get()
+        sides = tuple(key for key in EDGE_SIDE_LABELS if self._mask_side_vars[key].get())
         flipped = bool(self._mask_flip_var.get())
-        if side not in EDGE_SIDE_LABELS or (layer.side, layer.flipped) == (side, flipped):
+        try:
+            peaks = max(0, int(float(self._mask_peaks_var.get() or 0)))
+            amplitude = max(0, int(float(self._mask_amp_var.get() or 0)))
+        except ValueError:
+            return
+        if (layer.sides, layer.flipped, layer.peaks, layer.amplitude) == (sides, flipped, peaks, amplitude):
             return
         self.canvas.push_undo_checkpoint()
-        layer.side = side
+        layer.sides = sides
         layer.flipped = flipped
+        layer.peaks = peaks
+        layer.amplitude = amplitude
         self.canvas.redraw()
 
     def _on_mask_style_changed(self) -> None:
@@ -3749,6 +4451,7 @@ class ManifestationBoardApp(tk.Tk):
             messagebox.showerror("Image", "Numeric fields must be integers.")
             return
         self.canvas.push_undo_checkpoint()
+        flatten_source_rect(layer)
         layer.width = max(MIN_LAYER_SIZE, w)
         layer.height = max(MIN_LAYER_SIZE, h)
         record_resize_percent(layer)
@@ -3758,33 +4461,132 @@ class ManifestationBoardApp(tk.Tk):
         layer.stroke_after_mask = self._img_stroke_after_var.get()
         self.canvas.redraw()
 
+    def _apply_effects_props(self) -> None:
+        layer = self.canvas.selected_layer()
+        if not isinstance(layer, ImageLayer):
+            messagebox.showinfo("Effects", "Select an image on the board first.")
+            return
+        try:
+            offset = int(self._fx_shadow_offset_var.get())
+            blur = int(self._fx_shadow_blur_var.get())
+            shadow_opacity = int(self._fx_shadow_opacity_var.get())
+            bevel_size = int(self._fx_bevel_size_var.get())
+            emboss_strength = int(self._fx_emboss_strength_var.get())
+        except ValueError:
+            messagebox.showerror("Effects", "Numeric fields must be integers.")
+            return
+        shadow_color = self._fx_shadow_color_var.get().strip() or "#000000"
+        try:
+            ImageColor.getrgb(shadow_color)
+        except ValueError:
+            messagebox.showerror("Effects", f"Shadow color '{shadow_color}' is not a valid color.")
+            return
+        self.canvas.push_undo_checkpoint()
+        layer.effects = ImageEffects(
+            shadow=self._fx_shadow_var.get(),
+            shadow_offset=clamp(offset, 0, 200),
+            shadow_blur=clamp(blur, 0, 100),
+            shadow_color=shadow_color,
+            shadow_opacity=clamp(shadow_opacity, 0, 100) / 100.0,
+            bevel=self._fx_bevel_var.get(),
+            bevel_size=clamp(bevel_size, 1, 50),
+            emboss=self._fx_emboss_var.get(),
+            emboss_strength=clamp(emboss_strength, 0, 100) / 100.0,
+        )
+        self.canvas.redraw()
+
     def _reset_image_size(self) -> None:
         layer = self.canvas.selected_layer()
         if not isinstance(layer, ImageLayer):
             return
         self.canvas.push_undo_checkpoint()
+        flatten_source_rect(layer)
         layer.width = float(layer.source.width)
         layer.height = float(layer.source.height)
         record_resize_percent(layer)
         self._on_selection_changed(layer)
 
+    def _page_dpi(self) -> float:
+        """DPI used to convert inches to pixels. Raises ValueError when it is not a positive number."""
+        try:
+            dpi = float(self._page_dpi_var.get())
+        except ValueError:
+            raise ValueError("DPI must be a number.") from None
+        if dpi <= 0:
+            raise ValueError("DPI must be greater than zero.")
+        return dpi
+
+    def _read_page_entries(self) -> tuple[int, int]:
+        """Return the Width and Height fields as whole pixels. Raises ValueError with a user-facing message."""
+        if self._page_unit_var.get() == "in":
+            dpi = self._page_dpi()
+            try:
+                w_in = float(self._page_w_var.get())
+                h_in = float(self._page_h_var.get())
+            except ValueError:
+                raise ValueError("Width and height must be numbers of inches.") from None
+            return round(w_in * dpi), round(h_in * dpi)
+        try:
+            return int(self._page_w_var.get()), int(self._page_h_var.get())
+        except ValueError:
+            raise ValueError("Width and height must be integers.") from None
+
+    def _format_page_value(self, px: int) -> str:
+        if self._page_unit_var.get() == "in":
+            return f"{px / self._page_dpi():.2f}".rstrip("0").rstrip(".")
+        return str(px)
+
+    def _set_page_entries(self, w: int, h: int) -> None:
+        self._page_w_var.set(self._format_page_value(w))
+        self._page_h_var.set(self._format_page_value(h))
+
+    def _on_page_unit_changed(self) -> None:
+        """Keep the same page size when switching between pixels and inches."""
+        try:
+            w, h = self._read_in_units(self._page_unit_last)
+        except ValueError:
+            # Not a valid number in the old unit; show the page's real size instead.
+            w, h = self.canvas.page_width, self.canvas.page_height
+        self._page_unit_last = self._page_unit_var.get()
+        unit = "in" if self._page_unit_last == "in" else "px"
+        self._page_w_label.configure(text=f"Width ({unit})")
+        self._page_h_label.configure(text=f"Height ({unit})")
+        self._set_page_entries(w, h)
+
+    def _read_in_units(self, unit: str) -> tuple[int, int]:
+        """Read the entries as if they were in the given unit ('px' or 'in')."""
+        saved = self._page_unit_var.get()
+        self._page_unit_var.set(unit)
+        try:
+            return self._read_page_entries()
+        finally:
+            self._page_unit_var.set(saved)
+
     def _apply_page_from_panel(self) -> None:
         try:
-            w = int(self._page_w_var.get())
-            h = int(self._page_h_var.get())
-        except ValueError:
-            messagebox.showerror("Page", "Width and height must be integers.")
+            w, h = self._read_page_entries()
+        except ValueError as exc:
+            messagebox.showerror("Page", str(exc))
             return
         if self._landscape_var.get():
             # Landscape keeps the long side horizontal; a portrait preset is turned on its side.
             w, h = max(w, h), min(w, h)
-            self._page_w_var.set(str(w))
-            self._page_h_var.set(str(h))
+            self._set_page_entries(w, h)
         bg = self._page_bg_var.get().strip() or "#ffffff"
         self.canvas.set_page_size(w, h, bg=bg)
         self.canvas.paint_layer = Image.new("RGB", (self.canvas.page_width, self.canvas.page_height), bg)
         self.canvas.redraw()
         self._refresh_page_info()
+
+    def _set_default_page(self) -> None:
+        """Save the current page size and background as the default for new boards and startup."""
+        canvas = self.canvas
+        update_settings(default_page={"width": canvas.page_width, "height": canvas.page_height, "bg": canvas.page_bg})
+        messagebox.showinfo(
+            "Default page",
+            f"New boards and the next launch will start at {canvas.page_width} × {canvas.page_height} px "
+            f"with background {canvas.page_bg}.",
+        )
 
     def _refresh_preset_choices(self) -> None:
         self._preset_combo.configure(values=list(all_page_presets()))
@@ -3792,10 +4594,9 @@ class ManifestationBoardApp(tk.Tk):
     def _save_page_preset(self) -> None:
         """Save the Width and Height fields as a named preset in the dropdown."""
         try:
-            w = int(self._page_w_var.get())
-            h = int(self._page_h_var.get())
-        except ValueError:
-            messagebox.showerror("Page preset", "Width and height must be integers.")
+            w, h = self._read_page_entries()
+        except ValueError as exc:
+            messagebox.showerror("Page preset", str(exc))
             return
         if not (MIN_PAGE_SIZE <= w <= MAX_PAGE_SIZE and MIN_PAGE_SIZE <= h <= MAX_PAGE_SIZE):
             messagebox.showerror(
@@ -3840,9 +4641,112 @@ class ManifestationBoardApp(tk.Tk):
         if preset is None:
             return
         w, h = preset
-        self._page_w_var.set(str(w))
-        self._page_h_var.set(str(h))
+        self._set_page_entries(w, h)
         self._apply_page_from_panel()
+
+    def _edit_stroke_dialog(self, layer: ImageLayer) -> None:
+        """Edit the border of the selected images. Changes preview live; Cancel restores them."""
+        canvas = self.canvas
+        images = [item for item in canvas.selected_layers() if isinstance(item, ImageLayer)] or [layer]
+        originals = [(item, item.border_width, item.border_color, item.stroke_after_mask) for item in images]
+        first = images[0]
+        width_var = tk.StringVar(value=str(first.border_width))
+        color_var = tk.StringVar(value=first.border_color)
+        follow_var = tk.BooleanVar(value=first.stroke_after_mask)
+        pushed = {"undo": False}
+
+        dialog = tk.Toplevel(self)
+        count = len(images)
+        dialog.title(f"Edit stroke ({count} image{'s' if count != 1 else ''})")
+        dialog.configure(bg=self._current_palette()["root"])
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frame, text="Width (px):").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Spinbox(frame, from_=0, to=COLLAGE_MAX_STROKE, textvariable=width_var, width=8).grid(
+            row=0, column=1, sticky="w", padx=(8, 0), pady=4
+        )
+        ttk.Label(frame, text="Color:").grid(row=1, column=0, sticky="w", pady=4)
+        color_row = ttk.Frame(frame)
+        color_row.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=4)
+        ttk.Entry(color_row, textvariable=color_var, width=10).pack(side=tk.LEFT)
+
+        def pick_color() -> None:
+            chosen = colorchooser.askcolor(color=color_var.get(), title="Stroke color", parent=dialog)
+            if chosen[1]:
+                color_var.set(chosen[1])
+
+        ttk.Button(color_row, text="Pick…", command=pick_color).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Checkbutton(
+            frame,
+            text="Follow the mask edge",
+            variable=follow_var,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(
+            frame,
+            text="Width 0 removes the stroke.",
+            justify=tk.LEFT,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        def apply_live(*_args: object) -> None:
+            try:
+                width = int(width_var.get().strip())
+            except ValueError:
+                return
+            color = color_var.get().strip()
+            if not 0 <= width <= COLLAGE_MAX_STROKE:
+                return
+            if len(color) != 7 or not color.startswith("#") or any(ch not in "0123456789abcdefABCDEF" for ch in color[1:]):
+                return
+            follow = bool(follow_var.get())
+            if all(
+                item.border_width == width and item.border_color == color and item.stroke_after_mask == follow
+                for item in images
+            ):
+                return
+            if not pushed["undo"]:
+                canvas.push_undo_checkpoint()
+                pushed["undo"] = True
+            for item in images:
+                item.border_width = width
+                item.border_color = color
+                item.stroke_after_mask = follow
+            canvas.redraw()
+
+        width_var.trace_add("write", apply_live)
+        color_var.trace_add("write", apply_live)
+        follow_var.trace_add("write", apply_live)
+
+        def remove_stroke() -> None:
+            width_var.set("0")
+
+        def cancel() -> None:
+            for item, width, color, follow in originals:
+                item.border_width = width
+                item.border_color = color
+                item.stroke_after_mask = follow
+            if pushed["undo"] and canvas._undo_stack:
+                # Drop the undo step made for this edit; the board is back as it was.
+                canvas._undo_stack.pop()
+            canvas.redraw()
+            dialog.destroy()
+
+        def done() -> None:
+            canvas._on_selection_change(canvas.selected_layer())
+            canvas.redraw()
+            dialog.destroy()
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        ttk.Button(buttons, text="Remove stroke", command=remove_stroke).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Cancel", command=cancel).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Done", command=done).pack(side=tk.RIGHT, padx=(0, 6))
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        dialog.bind("<Escape>", lambda _e: cancel())
+        dialog.bind("<Return>", lambda _e: done())
+        dialog.grab_set()
 
     def _resize_presets_dialog(self) -> None:
         """Edit the percents used by the Low, Medium and High resize buttons."""
@@ -3918,14 +4822,122 @@ class ManifestationBoardApp(tk.Tk):
         ttk.Label(frame, text="Use the Page tab on the right, or set values here.").pack(anchor="w")
         ttk.Button(frame, text="Close", command=dialog.destroy).pack(pady=(12, 0))
 
+    def _history_marker(self) -> tuple[int, int, int]:
+        canvas = self.canvas
+        return (canvas.history_version, len(canvas._undo_stack), len(canvas._redo_stack))
+
+    def _mark_saved(self) -> None:
+        self._saved_marker = self._history_marker()
+
+    def _has_unsaved_changes(self) -> bool:
+        return self._saved_marker is not None and self._history_marker() != self._saved_marker
+
+    def _set_project_path(self, path: Optional[Path]) -> None:
+        self._project_path = path
+        self.title(f"Manifestation Board Studio — {path.name if path else 'Untitled'}")
+
+    def _confirm_unsaved(self) -> bool:
+        """True when the board can be replaced. Offers to save changes first."""
+        if not self._has_unsaved_changes():
+            return True
+        answer = messagebox.askyesnocancel("Unsaved changes", "Save changes to this collage first?")
+        if answer is None:
+            return False
+        if answer:
+            return self._project_save()
+        return True
+
+    def _write_project(self, path: Path) -> bool:
+        canvas = self.canvas
+        try:
+            save_project_file(path, canvas.layers, canvas.paint_layer, canvas.page_width, canvas.page_height, canvas.page_bg)
+        except (OSError, TypeError, ValueError) as exc:
+            messagebox.showerror("Save failed", f"Couldn't save {path.name}:\n{exc}")
+            return False
+        self._set_project_path(path)
+        self._mark_saved()
+        return True
+
+    def _project_save(self) -> bool:
+        if self._project_path is None:
+            return self._project_save_as()
+        return self._write_project(self._project_path)
+
+    def _project_save_as(self) -> bool:
+        path_str = filedialog.asksaveasfilename(
+            title="Save collage",
+            defaultextension=PROJECT_EXTENSION,
+            filetypes=[("Manifestation board collage", f"*{PROJECT_EXTENSION}")],
+            initialfile=self._project_path.name if self._project_path else f"collage{PROJECT_EXTENSION}",
+        )
+        if not path_str:
+            return False
+        return self._write_project(Path(path_str))
+
+    def _project_open(self) -> None:
+        if not self._confirm_unsaved():
+            return
+        path_str = filedialog.askopenfilename(
+            title="Open collage",
+            filetypes=[("Manifestation board collage", f"*{PROJECT_EXTENSION}")],
+        )
+        if not path_str:
+            return
+        path = Path(path_str)
+        try:
+            data = load_project_file(path)
+        except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
+            messagebox.showerror("Open failed", f"Couldn't open {path.name}:\n{exc}")
+            return
+        canvas = self.canvas
+        width = int(data["page_width"])  # type: ignore[arg-type]
+        height = int(data["page_height"])  # type: ignore[arg-type]
+        bg = str(data["page_bg"])
+        canvas.set_page_size(width, height, bg=bg)
+        canvas.paint_layer = data["paint_layer"]  # type: ignore[assignment]
+        canvas.layers = list(data["layers"])  # type: ignore[arg-type]
+        canvas.set_selection([], notify=False)
+        canvas.clear_history()
+        self._page_w_var.set(str(width))
+        self._page_h_var.set(str(height))
+        self._page_bg_var.set(bg)
+        canvas._on_selection_change(None)
+        canvas.redraw()
+        self._refresh_page_info()
+        self._set_project_path(path)
+        self._mark_saved()
+
+    def _refresh_mask_cancel_button(self) -> None:
+        active = self.canvas.mask_session is not None
+        self._cancel_mask_btn.state(["!disabled"] if active else ["disabled"])
+
+    def _cancel_mask_edit(self) -> None:
+        """Exit the mask edit and undo what it changed. Applied masks and other work are kept."""
+        if not self.canvas.cancel_mask_edit():
+            messagebox.showinfo("Cancel mask edit", "No mask edit is in progress.")
+        self._refresh_mask_cancel_button()
+
+    def _exit_app(self) -> None:
+        if self._confirm_unsaved():
+            self.destroy()
+
     def _new_board(self) -> None:
+        if not self._confirm_unsaved():
+            return
         if not messagebox.askyesno("New board", "Clear the current board and start fresh?"):
             return
         self.canvas.layers.clear()
         self.canvas.select_layer(None)
-        self.canvas.set_page_size(self.canvas.page_width, self.canvas.page_height)
+        width, height, bg = load_default_page()
+        self.canvas.set_page_size(width, height, bg=bg)
+        self._page_w_var.set(str(width))
+        self._page_h_var.set(str(height))
+        self._page_bg_var.set(bg)
+        self._refresh_page_info()
         self.canvas.clear_history()
         self.canvas.redraw()
+        self._set_project_path(None)
+        self._mark_saved()
 
     def _import_to_board(self) -> None:
         paths = filedialog.askopenfilenames(

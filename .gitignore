@@ -1,0 +1,10 @@
+# Secrets (OpenAI key, etc.)
+.env
+
+# Python bytecode and caches
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local virtual environment
+venv/
