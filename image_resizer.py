@@ -17,6 +17,7 @@ import urllib.error
 import urllib.request
 import uuid
 import zipfile
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 from pathlib import Path
@@ -357,11 +358,10 @@ def _compose_bordered_image(
     - stroke after mask: an outline around the visible, masked shape.
     """
     rx, ry, rw, rh = source_page_rect(layer)
-    resized = layer.source.convert("RGBA").resize(
-        (max(1, int(rw)), max(1, int(rh))),
-        Image.Resampling.LANCZOS,
-    )
+    resized = _resized_source(layer.source, (max(1, int(rw)), max(1, int(rh))))
     if layer.opacity < 1.0:
+        # The resample is shared with the cache, so change a copy, never the original.
+        resized = resized.copy()
         alpha = resized.split()[3]
         alpha = alpha.point(lambda p: int(p * layer.opacity))
         resized.putalpha(alpha)
@@ -481,6 +481,69 @@ def apply_shadow(
     top.paste(img, (pad, pad))
     shadow.alpha_composite(top)
     return shadow, pad
+
+
+# Resampled RGBA copies of image sources, reused while a layer is moved or its masks change.
+# Entries keep the source alive, so an id() key cannot be reused by another image while cached.
+_RESIZED_SOURCE_CACHE: "OrderedDict[tuple[int, tuple[int, int]], tuple[Image.Image, Image.Image]]" = OrderedDict()
+_RESIZED_SOURCE_LIMIT = 16
+
+
+def _resized_source(source: Image.Image, size: tuple[int, int]) -> Image.Image:
+    """RGBA copy of source at size. The result is shared: callers must not modify it."""
+    key = (id(source), size)
+    hit = _RESIZED_SOURCE_CACHE.get(key)
+    if hit is not None and hit[0] is source:
+        _RESIZED_SOURCE_CACHE.move_to_end(key)
+        return hit[1]
+    resized = source.convert("RGBA").resize(size, Image.Resampling.LANCZOS)
+    _RESIZED_SOURCE_CACHE[key] = (source, resized)
+    while len(_RESIZED_SOURCE_CACHE) > _RESIZED_SOURCE_LIMIT:
+        _RESIZED_SOURCE_CACHE.popitem(last=False)
+    return resized
+
+
+def vector_layer_raster(layer: "LineLayer | RectLayer | EllipseLayer") -> tuple[Image.Image, int, int]:
+    """Rasterize a line, rectangle or ellipse onto a transparent patch just big enough for it.
+
+    Returns (patch, ox, oy): the patch's top-left corner in page pixels.
+    """
+    if isinstance(layer, LineLayer):
+        xs = (layer.x1, layer.x2)
+        ys = (layer.y1, layer.y2)
+    else:
+        xs = (layer.x1, layer.x2)
+        ys = (layer.y1, layer.y2)
+    pad = max(1, layer.width) + 2
+    left = math.floor(min(xs)) - pad
+    top = math.floor(min(ys)) - pad
+    right = math.ceil(max(xs)) + pad
+    bottom = math.ceil(max(ys)) + pad
+    patch = Image.new("RGBA", (max(1, right - left), max(1, bottom - top)), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(patch)
+    x1, y1 = layer.x1 - left, layer.y1 - top
+    x2, y2 = layer.x2 - left, layer.y2 - top
+    if isinstance(layer, LineLayer):
+        draw.line((x1, y1, x2, y2), fill=layer.color, width=max(1, layer.width))
+    elif isinstance(layer, RectLayer):
+        draw.rectangle((x1, y1, x2, y2), outline=layer.outline, fill=layer.fill, width=max(1, layer.width))
+    else:
+        draw.ellipse((x1, y1, x2, y2), outline=layer.outline, fill=layer.fill, width=max(1, layer.width))
+    return patch, left, top
+
+
+def preview_resize(image: Image.Image, size: tuple[int, int]) -> Image.Image:
+    """Shrink for the on-screen preview: a box reduce by a whole factor, then LANCZOS.
+
+    About 3 to 5 times faster than one LANCZOS pass from full size, with little visible
+    difference at preview scale. Export does not use this; it resamples at full quality.
+    """
+    if size == image.size:
+        return image
+    factor = max(1, min(image.width // size[0], image.height // size[1]))
+    if factor > 1:
+        image = image.reduce(factor)
+    return image.resize(size, Image.Resampling.LANCZOS)
 
 
 def compose_image_layer(
@@ -834,6 +897,11 @@ class PosterCanvas(tk.Canvas):
         self.on_ai_edit: Optional[Callable[[ImageLayer], None]] = None
         # Default page: the one saved with Set as default page, or US Letter at 150 DPI, landscape.
         self.page_width, self.page_height, self.page_bg = load_default_page()
+        # Paint is stored behind a property (see paint_layer). Undo snapshots share it, so it is
+        # copied before any in-place change (copy-on-write).
+        self._paint_version = 0
+        self._paint_shared = False
+        self._paint: Image.Image = Image.new("RGB", (1, 1))
         self.paint_layer = Image.new(
             "RGB",
             (self.page_width, self.page_height),
@@ -870,6 +938,17 @@ class PosterCanvas(tk.Canvas):
         self._history_listener: Optional[Callable[[], None]] = None
         self._clipboard_layers: list[BoardLayer] = []
         self._drag_had_undo = False
+
+        # Retained scene. Each drawable layer is one canvas image, rebuilt only when its raster
+        # changes. Drags reposition items and only redraw the overlay. Requests are coalesced
+        # into one flush per idle cycle (see redraw).
+        self._raster_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
+        self._scene_items: dict[tuple[str, str], dict] = {}
+        self._paint_item: Optional[int] = None
+        self._paint_photo: Optional[ImageTk.PhotoImage] = None
+        self._paint_photo_state: Optional[tuple] = None
+        self._redraw_job: Optional[str] = None
+        self._scene_dirty = True
 
         self.bind("<Configure>", self._on_configure)
         self.bind("<ButtonPress-1>", self._on_press)
@@ -909,7 +988,8 @@ class PosterCanvas(tk.Canvas):
         """Return a deep copy of the current board state."""
         return BoardSnapshot(
             layers=[clone_board_layer(layer) for layer in self.layers],
-            paint_layer=self.paint_layer.copy(),
+            # Shared, not copied: the paint layer is copied on its next in-place change instead.
+            paint_layer=self.paint_layer,
             selected_id=self.selected_id,
             page_width=self.page_width,
             page_height=self.page_height,
@@ -921,7 +1001,7 @@ class PosterCanvas(tk.Canvas):
         self._restoring_history = True
         try:
             self.layers = [clone_board_layer(layer) for layer in snapshot.layers]
-            self.paint_layer = snapshot.paint_layer.copy()
+            self.paint_layer = snapshot.paint_layer  # the setter marks it shared, so it is never edited in place
             self.selected_id = snapshot.selected_id
             if self.get_layer(self.selected_id) is None:
                 self.selected_id = None
@@ -1282,6 +1362,11 @@ class PosterCanvas(tk.Canvas):
         )
         menu.add_command(label="Edit stroke…", command=lambda: self._edit_stroke_dialog(hit))
         menu.add_command(
+            label="Fit mask to image",
+            command=lambda: self._fit_first_mask(hit.id),
+            state="normal" if self.masks_for(hit.id) else "disabled",
+        )
+        menu.add_command(
             label="Remove mask",
             command=lambda: self.remove_mask(hit.id),
             state="normal" if self.can_remove_mask(hit.id) else "disabled",
@@ -1567,6 +1652,38 @@ class PosterCanvas(tk.Canvas):
         self._on_selection_change(self.selected_layer())
         self.redraw()
         return coverage, overlap
+
+    def delete_mask(self, mask_id: str) -> bool:
+        """Delete one live mask layer. The image itself is unchanged. Undoable."""
+        mask = self.get_layer(mask_id)
+        if not isinstance(mask, MaskLayer):
+            return False
+        self.push_undo_checkpoint()
+        self.layers = [layer for layer in self.layers if layer.id != mask_id]
+        self.set_selection([i for i in self.selected_ids if self.get_layer(i) is not None])
+        self.redraw()
+        return True
+
+    def _fit_first_mask(self, image_id: str) -> None:
+        """Fit the first mask on an image to that image and select the mask."""
+        masks = self.masks_for(image_id)
+        if masks and self.fit_mask_to_image(masks[0].id):
+            self.set_selection([masks[0].id])
+
+    def fit_mask_to_image(self, mask_id: str) -> bool:
+        """Set a mask's position and size to exactly cover its image. Undoable."""
+        mask = self.get_layer(mask_id)
+        if not isinstance(mask, MaskLayer):
+            return False
+        image = self.get_layer(mask.target_id)
+        if not isinstance(image, ImageLayer):
+            return False
+        self.push_undo_checkpoint()
+        mask.x, mask.y = image.x, image.y
+        mask.width, mask.height = image.width, image.height
+        mask.positioned = True
+        self.redraw()
+        return True
 
     def can_remove_mask(self, image_id: str) -> bool:
         """True when the image has a live mask, or an applied mask that can still be undone."""
@@ -2195,7 +2312,8 @@ class PosterCanvas(tk.Canvas):
                 layer.user_placed = True
             if isinstance(layer, MaskLayer):
                 layer.positioned = True
-            self.redraw()
+            # Only the outline follows the drag. The pixels are rebuilt once, on release.
+            self.redraw(scene=False)
             return
 
         if self.tool == "crop" and self._crop_target_id and self._shape_start:
@@ -2289,6 +2407,8 @@ class PosterCanvas(tk.Canvas):
         layer = self.get_layer(temp_id) if temp_id else self.selected_layer()
         if layer is not None:
             self._on_selection_change(layer)
+        # A resize drag only moved the outline, so the pixels are rebuilt here.
+        self.redraw()
 
     def _flood_fill(self, px: int, py: int) -> None:
         if not (0 <= px < self.page_width and 0 <= py < self.page_height):
@@ -2298,7 +2418,7 @@ class PosterCanvas(tk.Canvas):
         if target == fill_rgb:
             return
         ImageDraw.floodfill(
-            self.paint_layer,
+            self._paint_for_write(),
             (px, py),
             fill_rgb,
             thresh=self.fill_tolerance,
@@ -2315,20 +2435,198 @@ class PosterCanvas(tk.Canvas):
             )
         return 0, 0, 0
 
-    def redraw(self) -> None:
-        """Refresh the canvas from layer state."""
-        self.delete("all")
+    # The canvas keeps a retained scene. The paint layer and each drawable layer are canvas
+    # images, rebuilt only when their pixels change. Overlays (selection, handles, marquee,
+    # crop, mask outlines) are recreated on every refresh. Export still uses render_to_image.
+    # Page-scale layer rasters kept for reuse. Each can be several MB, so keep this bounded.
+    RASTER_CACHE_LIMIT = 48
+
+    @property
+    def paint_layer(self) -> Image.Image:
+        """The painted layer that sits under all board layers."""
+        return self._paint
+
+    @paint_layer.setter
+    def paint_layer(self, image: Image.Image) -> None:
+        self._paint = image
+        # Any paint object may also be held by an undo snapshot, so the next in-place change copies it.
+        self._paint_shared = True
+        self._paint_version += 1
+
+    def _paint_for_write(self) -> Image.Image:
+        """The paint layer, ready for an in-place change. Copies it first if an undo snapshot shares it."""
+        if self._paint_shared:
+            self._paint = self._paint.copy()
+            self._paint_shared = False
+        self._paint_version += 1
+        return self._paint
+
+    def redraw(self, *, scene: bool = True) -> None:
+        """Ask for a refresh. Requests made before the next idle moment are merged into one.
+
+        scene=False refreshes only the overlay, for drags that do not change any pixels yet.
+        """
+        if scene:
+            self._scene_dirty = True
+        if self._redraw_job is None:
+            self._redraw_job = self.after_idle(self._on_idle_redraw)
+
+    def redraw_now(self) -> None:
+        """Refresh the canvas immediately instead of waiting for the idle moment."""
+        if self._redraw_job is not None:
+            self.after_cancel(self._redraw_job)
+            self._redraw_job = None
+        if self._scene_dirty:
+            self._sync_scene()
+            self._scene_dirty = False
+        self._draw_overlays()
+
+    def _on_idle_redraw(self) -> None:
+        self._redraw_job = None
+        self.redraw_now()
+
+    def destroy(self) -> None:
+        if self._redraw_job is not None:
+            try:
+                self.after_cancel(self._redraw_job)
+            except tk.TclError:
+                pass
+            self._redraw_job = None
+        super().destroy()
+
+    def _sync_scene(self) -> None:
+        """Bring the paint layer, layer images and their stacking up to date with the board."""
+        ox, oy = self._board_offset()
+        zoom = self.zoom
+        self._sync_paint(ox, oy, zoom)
+        editing = {layer.target_id for layer in self.selected_layers() if isinstance(layer, MaskLayer)}
+
+        order: list[tuple[str, str]] = []  # bottom to top
+        for layer in self.layers:
+            if isinstance(layer, MaskLayer):
+                continue  # masks clip images and draw nothing themselves; their outlines are overlays
+            masks = self.masks_for(layer.id) if isinstance(layer, ImageLayer) else None
+            if isinstance(layer, ImageLayer) and layer.id in editing:
+                # While one of its masks is selected, the image also shows faintly and unclipped.
+                ghost = ("ghost", layer.id)
+                self._place_scene_item(ghost, self._layer_raster(layer, None, faint=True), ox, oy, zoom)
+                order.append(ghost)
+            slot = ("layer", layer.id)
+            self._place_scene_item(slot, self._layer_raster(layer, masks), ox, oy, zoom)
+            order.append(slot)
+
+        live = set(order)
+        for slot in [s for s in self._scene_items if s not in live]:
+            self.delete(self._scene_items.pop(slot)["item"])
+        for slot in order:
+            self.tag_raise(self._scene_items[slot]["item"])
+        if self._paint_item is not None:
+            self.tag_lower(self._paint_item)
+
+    def _sync_paint(self, ox: float, oy: float, zoom: float) -> None:
+        paint = self._paint
+        shown_size = (max(1, int(self.page_width * zoom)), max(1, int(self.page_height * zoom)))
+        state = (paint, self._paint_version, zoom, shown_size)
+        prev = self._paint_photo_state
+        if prev is None or prev[0] is not paint or prev[1:] != state[1:]:
+            shown = preview_resize(paint, shown_size)
+            self._paint_photo = ImageTk.PhotoImage(shown)
+            self._paint_photo_state = state
+            if self._paint_item is None:
+                self._paint_item = self.create_image(0, 0, anchor="nw", tags="paint")
+            self.itemconfigure(self._paint_item, image=self._paint_photo)
+        self.coords(self._paint_item, ox, oy)
+
+    def _place_scene_item(
+        self,
+        slot: tuple[str, str],
+        raster: tuple,
+        ox: float,
+        oy: float,
+        zoom: float,
+    ) -> None:
+        """Show one layer raster at the zoom level. Its pixels are resized only when they change."""
+        key, image, px, py, keep = raster
+        rec = self._scene_items.get(slot)
+        if rec is None:
+            rec = {"item": self.create_image(0, 0, anchor="nw", tags="layer"), "key": None, "zoom": None, "photo": None, "keep": None}
+            self._scene_items[slot] = rec
+        if rec["key"] != key or rec["zoom"] != zoom:
+            # Resize from the page-scale raster straight to its on-screen size.
+            shown_size = (max(1, round(image.width * zoom)), max(1, round(image.height * zoom)))
+            shown = preview_resize(image, shown_size)
+            rec["photo"] = ImageTk.PhotoImage(shown)
+            rec["key"] = key
+            rec["zoom"] = zoom
+            rec["keep"] = keep  # keeps the source alive while the item shows it, so its id stays unique
+            self.itemconfigure(rec["item"], image=rec["photo"])
+        self.coords(rec["item"], ox + px * zoom, oy + py * zoom)
+
+    def _layer_raster(self, layer: BoardLayer, masks: Optional[list[MaskLayer]], *, faint: bool = False) -> tuple:
+        """Page-space raster of one layer as (key, image, x, y, keepalive), cached by what changes its pixels.
+
+        Image layers are composed at the origin and then shifted by whole pixels, so moving a
+        layer on its own reuses the cached work unless a mask's position relative to it changed.
+        """
+        if isinstance(layer, ImageLayer):
+            ix, iy = math.floor(layer.x), math.floor(layer.y)
+            local_masks = [
+                replace(mask, x=float(round(mask.x - ix)), y=float(round(mask.y - iy)))
+                for mask in (masks or [])
+            ]
+            key = (
+                "image",
+                id(layer.source),
+                layer.source_rect,
+                layer.width,
+                layer.height,
+                layer.opacity,
+                layer.border_width,
+                layer.border_color,
+                layer.stroke_after_mask,
+                layer.effects,
+                faint,
+                tuple(
+                    (m.x, m.y, m.width, m.height, m.shape, m.corner_radius, m.sides, m.flipped, m.peaks, m.amplitude)
+                    for m in local_masks
+                ),
+            )
+            keep: object = layer.source
+        else:
+            key = (
+                type(layer).__name__,
+                layer.x1, layer.y1, layer.x2, layer.y2,
+                getattr(layer, "color", None), getattr(layer, "outline", None),
+                getattr(layer, "fill", None), layer.width,
+            )
+            keep = None
+
+        # The cache stores each raster's offset from the layer's whole-pixel origin, so a moved
+        # layer finds its cached raster and is placed at its current position.
+        base_x, base_y = (ix, iy) if isinstance(layer, ImageLayer) else (0, 0)
+        cached = self._raster_cache.get(key)
+        if cached is not None:
+            self._raster_cache.move_to_end(key)
+        else:
+            if isinstance(layer, ImageLayer):
+                # The ghost is drawn unclipped, so it takes no masks and is composed at its faint opacity.
+                source = replace(layer, x=0.0, y=0.0, opacity=layer.opacity * (MASK_GUIDE_OPACITY if faint else 1.0))
+                image, rel_x, rel_y = compose_image_layer(source, local_masks or None)
+            else:
+                image, rel_x, rel_y = vector_layer_raster(layer)
+            cached = (image, rel_x, rel_y, keep)
+            self._raster_cache[key] = cached
+            while len(self._raster_cache) > self.RASTER_CACHE_LIMIT:
+                self._raster_cache.popitem(last=False)
+        image, rel_x, rel_y, keep = cached
+        return key, image, base_x + rel_x, base_y + rel_y, keep
+
+    def _draw_overlays(self) -> None:
+        """Selection outlines, handles, marquee, crop box and the board border. Always on top."""
+        self.delete("overlay")
         ox, oy = self._board_offset()
         disp_w = self.page_width * self.zoom
         disp_h = self.page_height * self.zoom
-
-        preview = self.render_to_image(show_mask_guides=True)
-        preview = preview.resize(
-            (max(1, int(disp_w)), max(1, int(disp_h))),
-            Image.Resampling.LANCZOS,
-        )
-        self._board_photo = ImageTk.PhotoImage(preview)
-        self.create_image(ox, oy, anchor="nw", image=self._board_photo, tags="board")
         self.create_rectangle(
             ox,
             oy,
@@ -2336,7 +2634,7 @@ class PosterCanvas(tk.Canvas):
             oy + disp_h,
             outline="#666666",
             width=1,
-            tags="board",
+            tags="overlay",
         )
 
         # Masks are editor-only outlines; they are never drawn into the exported image.
@@ -2344,14 +2642,14 @@ class PosterCanvas(tk.Canvas):
             if isinstance(mask, MaskLayer) and mask.id not in self.selected_ids:
                 mx1, my1 = self.page_to_canvas(mask.x, mask.y)
                 mx2, my2 = self.page_to_canvas(mask.x + mask.width, mask.y + mask.height)
-                self.create_rectangle(mx1, my1, mx2, my2, outline=MASK_OUTLINE_COLOR, width=1, dash=(2, 4))
+                self.create_rectangle(mx1, my1, mx2, my2, outline=MASK_OUTLINE_COLOR, width=1, dash=(2, 4), tags="overlay")
 
         for selected in self.selected_layers():
             bx1, by1, bx2, by2 = self._layer_bbox(selected)
             sx1, sy1 = self.page_to_canvas(bx1, by1)
             sx2, sy2 = self.page_to_canvas(bx2, by2)
             highlight = MASK_OUTLINE_COLOR if isinstance(selected, MaskLayer) else "#4a9eff"
-            self.create_rectangle(sx1, sy1, sx2, sy2, outline=highlight, width=2, dash=(4, 2))
+            self.create_rectangle(sx1, sy1, sx2, sy2, outline=highlight, width=2, dash=(4, 2), tags="overlay")
 
         layer = self.selected_layer()
         if len(self.selected_ids) == 1 and isinstance(layer, (ImageLayer, MaskLayer)):
@@ -2367,12 +2665,13 @@ class PosterCanvas(tk.Canvas):
                     fill="#ffffff",
                     outline=color,
                     width=2,
+                    tags="overlay",
                 )
 
         if self._marquee_start is not None and self._marquee_end is not None:
             mx1, my1 = self.page_to_canvas(*self._marquee_start)
             mx2, my2 = self.page_to_canvas(*self._marquee_end)
-            self.create_rectangle(mx1, my1, mx2, my2, outline="#4a9eff", width=1, dash=(3, 3))
+            self.create_rectangle(mx1, my1, mx2, my2, outline="#4a9eff", width=1, dash=(3, 3), tags="overlay")
 
         if self._crop_target_id and self._shape_start and self._crop_end_page:
             sx, sy = self._shape_start
@@ -2387,7 +2686,29 @@ class PosterCanvas(tk.Canvas):
                 outline="#e67e22",
                 width=2,
                 dash=(6, 3),
+                tags="overlay",
             )
+
+    def composed_page_image(self) -> Image.Image:
+        """The scene composed at page scale, the same way the on-screen scene shows it.
+
+        Used to check the retained scene against render_to_image.
+        """
+        editing = {layer.target_id for layer in self.selected_layers() if isinstance(layer, MaskLayer)}
+        base = self._paint.convert("RGBA")
+        for layer in self.layers:
+            if isinstance(layer, MaskLayer):
+                continue
+            parts = []
+            if isinstance(layer, ImageLayer):
+                if layer.id in editing:
+                    parts.append(self._layer_raster(layer, None, faint=True))
+                parts.append(self._layer_raster(layer, self.masks_for(layer.id)))
+            else:
+                parts.append(self._layer_raster(layer, None))
+            for _key, image, x, y, _keep in parts:
+                base.paste(image, (x, y), image)
+        return base
 
 
 # Print tiling: paper sizes in inches, (width, height) portrait.
@@ -2624,9 +2945,43 @@ def load_project_file(path: Path) -> dict[str, object]:
 
 
 OPENAI_EDIT_URL = "https://api.openai.com/v1/images/edits"
+OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
 AI_DEFAULT_MODEL = "gpt-image-1"
+# Shown before the list has been refreshed from OpenAI.
+AI_FALLBACK_MODELS = ["gpt-image-1", "dall-e-2"]
 AI_MAX_INPUT_SIDE = 2048
 AI_TIMEOUT_SECONDS = 300
+
+
+def openai_list_image_models(api_key: str) -> list[str]:
+    """Image model ids this API key can use, read from the OpenAI models list.
+
+    Raises RuntimeError with a readable message on any failure.
+    """
+    request = urllib.request.Request(
+        OPENAI_MODELS_URL,
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = json.loads(exc.read().decode("utf-8")).get("error", {}).get("message", "")
+        except Exception:
+            pass
+        raise RuntimeError(f"OpenAI error {exc.code}: {detail or exc.reason}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"Could not reach OpenAI: {exc}") from exc
+    try:
+        ids = [str(item["id"]) for item in payload["data"]]
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError(f"Unexpected response from OpenAI: {exc}") from exc
+    models = sorted(i for i in ids if i.startswith(("gpt-image", "dall-e")))
+    if not models:
+        raise RuntimeError("This key has no image models listed.")
+    return models
 
 
 def openai_edit_image(api_key: str, model: str, prompt: str, image: Image.Image) -> Image.Image:
@@ -2715,6 +3070,11 @@ class AIChatPane(ttk.Frame):
         self._key_var = tk.StringVar(value=saved_key or os.environ.get("OPENAI_API_KEY", ""))
         self._remember_var = tk.BooleanVar(value=bool(saved_key))
         self._model_var = tk.StringVar(value=str(settings.get("openai_image_model") or AI_DEFAULT_MODEL))
+        self._model_results: "queue.Queue[tuple[str, object]]" = queue.Queue()
+        saved_models = settings.get("openai_image_models")
+        model_choices = [str(m) for m in saved_models] if isinstance(saved_models, list) and saved_models else list(AI_FALLBACK_MODELS)
+        if self._model_var.get() not in model_choices:
+            model_choices.insert(0, self._model_var.get())
         self._status_var = tk.StringVar(value="Right-click an image > Generate with AI…")
 
         cfg = ttk.Frame(self._body)
@@ -2723,7 +3083,16 @@ class AIChatPane(ttk.Frame):
         ttk.Label(cfg, text="API key").grid(row=0, column=0, sticky="w")
         ttk.Entry(cfg, textvariable=self._key_var, show="•", width=18).grid(row=0, column=1, sticky="ew", pady=1)
         ttk.Label(cfg, text="Model").grid(row=1, column=0, sticky="w")
-        ttk.Entry(cfg, textvariable=self._model_var, width=18).grid(row=1, column=1, sticky="ew", pady=1)
+        self._model_combo = ttk.Combobox(
+            cfg,
+            textvariable=self._model_var,
+            values=model_choices,
+            state="readonly",
+            width=18,
+        )
+        self._model_combo.grid(row=1, column=1, sticky="ew", pady=1)
+        self._refresh_model_btn = ttk.Button(cfg, text="Refresh", command=self._refresh_models)
+        self._refresh_model_btn.grid(row=1, column=2, padx=(4, 0), pady=1)
         ttk.Checkbutton(
             cfg,
             text="Remember key (plain text in settings file)",
@@ -2841,6 +3210,41 @@ class AIChatPane(ttk.Frame):
 
         threading.Thread(target=work, daemon=True).start()
         self.after(150, self._poll)
+
+    def _refresh_models(self) -> None:
+        """Fetch the image models this key can use, in the background, and fill the Model dropdown."""
+        key = self._key_var.get().strip()
+        if not key:
+            self._status_var.set("Enter your OpenAI API key first.")
+            return
+        self._refresh_model_btn.state(["disabled"])
+        self._status_var.set("Loading models…")
+
+        def work() -> None:
+            try:
+                self._model_results.put(("ok", openai_list_image_models(key)))
+            except Exception as exc:  # shown to the user
+                self._model_results.put(("err", str(exc)))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(150, self._poll_models)
+
+    def _poll_models(self) -> None:
+        try:
+            kind, data = self._model_results.get_nowait()
+        except queue.Empty:
+            self.after(150, self._poll_models)
+            return
+        self._refresh_model_btn.state(["!disabled"])
+        if kind == "err":
+            self._status_var.set(f"Could not load models: {data}")
+            return
+        models = [str(m) for m in data]  # type: ignore[union-attr]
+        self._model_combo.configure(values=models)
+        if self._model_var.get() not in models:
+            self._model_var.set(models[0])
+        update_settings(openai_image_models=models, openai_image_model=self._model_var.get())
+        self._status_var.set(f"Loaded {len(models)} image model(s).")
 
     def _poll(self) -> None:
         try:
@@ -3689,6 +4093,8 @@ class ManifestationBoardApp(tk.Tk):
         self._cancel_mask_btn = ttk.Button(mask_tab, text="Cancel mask edit", command=self._cancel_mask_edit)
         self._cancel_mask_btn.pack(fill=tk.X, pady=(4, 0))
         self._cancel_mask_btn.state(["disabled"])
+        ttk.Button(mask_tab, text="Fit to image", command=self._fit_mask_to_image).pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(mask_tab, text="Remove mask", command=self._remove_selected_mask).pack(fill=tk.X, pady=(4, 0))
         self._apply_mask_btn.state(["disabled"])
         ttk.Label(
             mask_tab,
@@ -4036,9 +4442,108 @@ class ManifestationBoardApp(tk.Tk):
         ttk.Button(row_buttons, text="Copy defaults to every image", command=copy_defaults).pack(side=tk.LEFT)
         ttk.Button(row_buttons, text="Randomize colors", command=randomize_colors).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(row_buttons, text="Randomize masks", command=randomize_masks).pack(side=tk.LEFT, padx=(6, 0))
-        box = ttk.LabelFrame(frame, text="Images: size % of each image's set size, mask and stroke", padding=6)
-        box.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
-        list_canvas = tk.Canvas(box, width=640, height=300, highlightthickness=0, bg=self._current_palette()["field"])
+
+        presets: dict[str, float] = {
+            "100% (original)": 100.0,
+            **{f"{level} {percent}%": float(percent) for level, percent in load_importance_percent().items()},
+        }
+
+        def preset_label(value: Optional[float]) -> str:
+            """The preset whose percent matches value, or Custom."""
+            for label, percent in presets.items():
+                if value is not None and abs(percent - value) < 1e-6:
+                    return label
+            return "Custom"
+
+        def parse_percent(text: str) -> Optional[float]:
+            try:
+                return float(text.strip())
+            except ValueError:
+                return None
+
+        def selected_rows() -> list[dict[str, object]]:
+            return [row for row in rows if row["select"].get()]  # type: ignore[union-attr]
+
+        def set_all_selected(flag: bool) -> None:
+            for row in rows:
+                row["select"].set(flag)  # type: ignore[union-attr]
+
+        def apply_bulk() -> None:
+            targets = selected_rows()
+            if not targets:
+                messagebox.showinfo("Make Collage", "Tick the Select box on one or more rows first.", parent=dialog)
+                return
+            percent = parse_percent(bulk_percent.get())
+            try:
+                stroke_value = int(bulk_stroke.get().strip())
+            except ValueError:
+                messagebox.showerror("Make Collage", "Stroke px must be a whole number.", parent=dialog)
+                return
+            color_value = bulk_color.get().strip()
+            if percent is None or not 1 <= percent <= 400:
+                messagebox.showerror("Make Collage", "Size % must be a number from 1 to 400.", parent=dialog)
+                return
+            if not 0 <= stroke_value <= COLLAGE_MAX_STROKE:
+                messagebox.showerror("Make Collage", f"Stroke px must be 0–{COLLAGE_MAX_STROKE}.", parent=dialog)
+                return
+            if not _is_hex_color(color_value):
+                messagebox.showerror("Make Collage", "Color must look like #rrggbb.", parent=dialog)
+                return
+            for row in targets:
+                row["shape"].set(bulk_shape.get())  # type: ignore[union-attr]
+                row["stroke"].set(str(stroke_value))  # type: ignore[union-attr]
+                row["color"].set(color_value)  # type: ignore[union-attr]
+                row["percent"].set(f"{percent:g}")  # type: ignore[union-attr]
+
+        def randomize_size() -> None:
+            targets = selected_rows() or rows
+            low = parse_percent(min_var.get())
+            high = parse_percent(max_var.get())
+            if low is None or high is None or not (1 <= low <= high <= 400):
+                messagebox.showerror(
+                    "Make Collage", "Random size needs a min and max from 1 to 400, with min not above max.", parent=dialog
+                )
+                return
+            for row in targets:
+                row["percent"].set(f"{random.uniform(low, high):.0f}")  # type: ignore[union-attr]
+
+        bulk = ttk.LabelFrame(frame, text="Selected rows", padding=6)
+        bulk.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        bulk_shape = tk.StringVar(value=choice_var.get())
+        bulk_stroke = tk.StringVar(value=stroke_var.get())
+        bulk_color = tk.StringVar(value=color_var.get())
+        bulk_percent = tk.StringVar(value="100")
+        min_var = tk.StringVar(value="50")
+        max_var = tk.StringVar(value="150")
+        ttk.Button(bulk, text="Select all", command=lambda: set_all_selected(True)).grid(row=0, column=0, padx=2, pady=2)
+        ttk.Button(bulk, text="Clear", command=lambda: set_all_selected(False)).grid(row=0, column=1, padx=2, pady=2)
+        ttk.Label(bulk, text="Mask").grid(row=0, column=2, padx=(10, 2))
+        ttk.Combobox(bulk, textvariable=bulk_shape, values=labels, state="readonly", width=15).grid(
+            row=0, column=3, padx=2
+        )
+        ttk.Label(bulk, text="Stroke px").grid(row=0, column=4, padx=(10, 2))
+        ttk.Spinbox(bulk, from_=0, to=COLLAGE_MAX_STROKE, textvariable=bulk_stroke, width=5).grid(
+            row=0, column=5, padx=2
+        )
+        ttk.Label(bulk, text="Color").grid(row=0, column=6, padx=(10, 2))
+        ttk.Entry(bulk, textvariable=bulk_color, width=9).grid(row=0, column=7, padx=2)
+        ttk.Label(bulk, text="Size %").grid(row=0, column=8, padx=(10, 2))
+        ttk.Entry(bulk, textvariable=bulk_percent, width=6).grid(row=0, column=9, padx=2)
+        ttk.Button(bulk, text="Apply to selected", command=apply_bulk).grid(row=0, column=10, padx=(10, 2))
+        ttk.Label(bulk, text="Random size: min %").grid(row=1, column=2, sticky="e", pady=(6, 0))
+        ttk.Entry(bulk, textvariable=min_var, width=6).grid(row=1, column=3, sticky="w", pady=(6, 0))
+        ttk.Label(bulk, text="max %").grid(row=1, column=4, sticky="e", pady=(6, 0))
+        ttk.Entry(bulk, textvariable=max_var, width=6).grid(row=1, column=5, sticky="w", pady=(6, 0))
+        ttk.Button(bulk, text="Randomize size", command=randomize_size).grid(
+            row=1, column=6, columnspan=2, sticky="w", padx=(10, 2), pady=(6, 0)
+        )
+        ttk.Label(bulk, text="Randomizes the ticked rows, or every row if none is ticked.").grid(
+            row=1, column=8, columnspan=3, sticky="w", pady=(6, 0)
+        )
+
+        box = ttk.LabelFrame(frame, text="Images: select, size % (or preset), mask and stroke", padding=6)
+        box.grid(row=7, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
+        list_canvas = tk.Canvas(box, width=780, height=300, highlightthickness=0, bg=self._current_palette()["field"])
         scroll = ttk.Scrollbar(box, orient=tk.VERTICAL, command=list_canvas.yview)
         inner = ttk.Frame(list_canvas)
         inner.bind("<Configure>", lambda _e: list_canvas.configure(scrollregion=list_canvas.bbox("all")))
@@ -4047,34 +4552,59 @@ class ManifestationBoardApp(tk.Tk):
         list_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        for column, title in enumerate(("", "Image", "Size %", "Mask", "Stroke px", "Color", "")):
+        for column, title in enumerate(("", "", "Image", "Preset", "Size %", "Mask", "Stroke px", "Color", "")):
             ttk.Label(inner, text=title).grid(row=0, column=column, sticky="w", padx=4, pady=(0, 4))
         for index, layer in enumerate(images, start=1):
+            select_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(inner, variable=select_var).grid(row=index, column=0, padx=(4, 0))
             thumb = _collage_base(layer).convert("RGBA").copy()
             thumb.thumbnail((56, 56))
             photo = ImageTk.PhotoImage(thumb)
             thumbs.append(photo)
-            ttk.Label(inner, image=photo).grid(row=index, column=0, padx=4, pady=3)
+            ttk.Label(inner, image=photo).grid(row=index, column=1, padx=4, pady=3)
             name = layer.source_path.name if layer.source_path else f"Image {index}"
-            ttk.Label(inner, text=name, width=18).grid(row=index, column=1, sticky="w", padx=4)
+            ttk.Label(inner, text=name, width=18).grid(row=index, column=2, sticky="w", padx=4)
+
             percent_var = tk.StringVar(value="100")
-            ttk.Entry(inner, textvariable=percent_var, width=7).grid(row=index, column=2, padx=4)
+            preset_var = tk.StringVar(value=preset_label(100.0))
+            preset_combo = ttk.Combobox(
+                inner,
+                textvariable=preset_var,
+                values=["Custom", *presets],
+                state="readonly",
+                width=15,
+            )
+            preset_combo.grid(row=index, column=3, padx=4)
+
+            def choose_preset(_event: object = None, pv: tk.StringVar = preset_var, pct: tk.StringVar = percent_var) -> None:
+                value = presets.get(pv.get())
+                if value is not None:
+                    pct.set(f"{value:g}")
+
+            preset_combo.bind("<<ComboboxSelected>>", choose_preset)
+            ttk.Entry(inner, textvariable=percent_var, width=7).grid(row=index, column=4, padx=4)
+            percent_var.trace_add(
+                "write",
+                lambda *_args, pv=percent_var, lv=preset_var: lv.set(preset_label(parse_percent(pv.get()))),
+            )
             shape_var = tk.StringVar(value=choice_var.get())
             ttk.Combobox(inner, textvariable=shape_var, values=labels, state="readonly", width=16).grid(
-                row=index, column=3, padx=4
+                row=index, column=5, padx=4
             )
             row_stroke_var = tk.StringVar(value=stroke_var.get())
             ttk.Spinbox(inner, from_=0, to=COLLAGE_MAX_STROKE, textvariable=row_stroke_var, width=5).grid(
-                row=index, column=4, padx=4
+                row=index, column=6, padx=4
             )
             row_color_var = tk.StringVar(value=color_var.get())
-            ttk.Entry(inner, textvariable=row_color_var, width=9).grid(row=index, column=5, padx=4)
+            ttk.Entry(inner, textvariable=row_color_var, width=9).grid(row=index, column=7, padx=4)
             ttk.Button(inner, text="Pick…", command=lambda v=row_color_var: pick_row_color(v)).grid(
-                row=index, column=6, padx=(2, 4)
+                row=index, column=8, padx=(2, 4)
             )
             rows.append(
                 {
                     "layer": layer,
+                    "select": select_var,
+                    "preset": preset_var,
                     "percent": percent_var,
                     "shape": shape_var,
                     "stroke": row_stroke_var,
@@ -4170,7 +4700,7 @@ class ManifestationBoardApp(tk.Tk):
             )
 
         buttons = ttk.Frame(frame)
-        buttons.grid(row=7, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        buttons.grid(row=8, column=0, columnspan=2, sticky="e", pady=(12, 0))
         ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT)
         ttk.Button(buttons, text="Make collage", command=confirm).pack(side=tk.RIGHT, padx=(0, 6))
         dialog.bind("<Escape>", lambda _e: dialog.destroy())
@@ -4912,6 +5442,24 @@ class ManifestationBoardApp(tk.Tk):
     def _refresh_mask_cancel_button(self) -> None:
         active = self.canvas.mask_session is not None
         self._cancel_mask_btn.state(["!disabled"] if active else ["disabled"])
+
+    def _remove_selected_mask(self) -> None:
+        """Delete the selected mask. The image keeps its position and pixels."""
+        layer = self.canvas.selected_layer()
+        if not isinstance(layer, MaskLayer):
+            messagebox.showinfo("Remove mask", "Select a mask on the board first.")
+            return
+        if self.canvas.delete_mask(layer.id):
+            self._on_selection_changed(self.canvas.selected_layer())
+
+    def _fit_mask_to_image(self) -> None:
+        """Make the selected mask exactly match its image's position and size."""
+        layer = self.canvas.selected_layer()
+        if not isinstance(layer, MaskLayer):
+            messagebox.showinfo("Fit to image", "Select a mask on the board first.")
+            return
+        if self.canvas.fit_mask_to_image(layer.id):
+            self._on_selection_changed(layer)
 
     def _cancel_mask_edit(self) -> None:
         """Exit the mask edit and undo what it changed. Applied masks and other work are kept."""
