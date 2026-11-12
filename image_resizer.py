@@ -11,6 +11,7 @@ import math
 import os
 import queue
 import random
+import re
 import threading
 import tkinter as tk
 import urllib.error
@@ -242,6 +243,22 @@ MASK_SHAPE_LABELS: dict[MaskShape, str] = {
 }
 
 
+def normalize_tag(text: str) -> str:
+    """Make a tag usable as @tag in a prompt: letters, digits, '_' and '-' only, no leading '@'."""
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "-", text.strip().lstrip("@")).strip("-")
+    return cleaned[:32]
+
+
+def find_tag_mentions(prompt: str) -> list[str]:
+    """Tags written as @tag in a prompt, lower-cased, in order and without repeats."""
+    seen: list[str] = []
+    for match in re.finditer(r"(?<![\w@])@([A-Za-z0-9_-]+)", prompt):
+        tag = match.group(1).lower()
+        if tag not in seen:
+            seen.append(tag)
+    return seen
+
+
 def is_image_path(path: Path) -> bool:
     """Return True if path has a supported image extension."""
     return path.suffix.lower() in SUPPORTED_EXTENSIONS
@@ -286,6 +303,76 @@ def _unmasked_pixels(
     right = max(left + 1, round((x + w - bx) * scale_x))
     bottom = max(top + 1, round((y + h - by) * scale_y))
     return base.convert("RGBA").crop((left, top, right, bottom))
+
+
+def _boxes_overlap(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> bool:
+    """True when two (x, y, w, h) boxes share area. Touching edges do not count."""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    return ax < bx + bw - 0.5 and bx < ax + aw - 0.5 and ay < by + bh - 0.5 and by < ay + ah - 0.5
+
+
+def place_avoiding(
+    items: list[dict[str, object]],
+    obstacles: list[tuple[float, float, float, float]],
+    page_width: float,
+    page_height: float,
+) -> tuple[list[tuple[float, float, float, float]], int]:
+    """Place each item at its planned spot unless that spot overlaps an obstacle or an earlier
+    placed item. Then the nearest clear spot is used. Items marked shrinkable are reduced, a
+    little at a time, when no spot is clear at full size.
+
+    Each item is a dict with x0, y0 (planned top-left), fw, fh (box size) and shrinkable.
+    Returns ((x, y, w, h) per item, number of items that could not be placed without overlap).
+    Items that could not be placed stay at their planned spot.
+    """
+    placed: list[tuple[float, float, float, float]] = list(obstacles)
+    results: list[tuple[float, float, float, float]] = []
+    unplaced = 0
+    step = max(8.0, min(page_width, page_height) / 60)
+    for item in items:
+        x0, y0 = float(item["x0"]), float(item["y0"])  # type: ignore[arg-type]
+        base_w, base_h = float(item["fw"]), float(item["fh"])  # type: ignore[arg-type]
+        shrinkable = bool(item["shrinkable"])
+        scale = 1.0
+        found: Optional[tuple[float, float, float, float]] = None
+        for _attempt in range(12):
+            fw, fh = base_w * scale, base_h * scale
+            if fw <= page_width and fh <= page_height:
+                here = (x0, y0, fw, fh)
+                if x0 >= 0 and y0 >= 0 and x0 + fw <= page_width and y0 + fh <= page_height and not any(
+                    _boxes_overlap(here, other) for other in placed
+                ):
+                    found = here
+                    break
+                best: Optional[tuple[float, float, float, float]] = None
+                best_distance = float("inf")
+                y = 0.0
+                while y + fh <= page_height + 0.5:
+                    x = 0.0
+                    while x + fw <= page_width + 0.5:
+                        candidate = (x, y, fw, fh)
+                        distance = (x - x0) ** 2 + (y - y0) ** 2
+                        if distance < best_distance and not any(
+                            _boxes_overlap(candidate, other) for other in placed
+                        ):
+                            best, best_distance = candidate, distance
+                        x += step
+                    y += step
+                if best is not None:
+                    found = best
+                    break
+            if not shrinkable:
+                break
+            scale *= 0.9
+        if found is None:
+            unplaced += 1
+            results.append((x0, y0, base_w, base_h))
+            placed.append((x0, y0, base_w, base_h))
+        else:
+            results.append(found)
+            placed.append(found)
+    return results, unplaced
 
 
 def _is_hex_color(value: str) -> bool:
@@ -762,6 +849,8 @@ class ImageLayer:
     # True: the border follows the masked shape's outline.
     stroke_after_mask: bool = False
     effects: ImageEffects = field(default_factory=ImageEffects)
+    # Short name the AI chat can refer to as @tag; empty means untagged.
+    tag: str = ""
     # None: the pixels fill the box. Set by Edit applied mask: (x, y, w, h) of the restored pixels,
     # with x and y relative to the box's top-left, so the box stays where the user left it.
     source_rect: Optional[tuple[float, float, float, float]] = None
@@ -895,6 +984,8 @@ class PosterCanvas(tk.Canvas):
         self._on_selection_change = on_selection_change
         # Set by the app: called with the image layer when "Generate with AI…" is chosen.
         self.on_ai_edit: Optional[Callable[[ImageLayer], None]] = None
+        # Editor preference (not saved in projects): draw and allow clicking mask outlines.
+        self.show_masks = bool(load_settings().get("show_masks", True))
         # Default page: the one saved with Set as default page, or US Letter at 150 DPI, landscape.
         self.page_width, self.page_height, self.page_bg = load_default_page()
         # Paint is stored behind a property (see paint_layer). Undo snapshots share it, so it is
@@ -1334,6 +1425,10 @@ class PosterCanvas(tk.Canvas):
         hit = self._hit_test(px, py)
         if not isinstance(hit, ImageLayer):
             return
+        self.show_image_menu(hit, event.x_root, event.y_root)
+
+    def show_image_menu(self, hit: ImageLayer, x_root: int, y_root: int) -> None:
+        """Pop up the image menu for hit. Other selected layers stay selected."""
         # Keep the rest of a multi-selection, but make the clicked layer the active one.
         self.set_selection([*[i for i in self.selected_ids if i != hit.id], hit.id])
         idx = next(i for i, layer in enumerate(self.layers) if layer.id == hit.id)
@@ -1353,6 +1448,10 @@ class PosterCanvas(tk.Canvas):
             label="Generate with AI…",
             command=lambda: self.on_ai_edit(hit) if self.on_ai_edit else None,
             state="normal" if self.on_ai_edit else "disabled",
+        )
+        menu.add_command(
+            label="Set AI tag…" if not hit.tag else f"AI tag: @{hit.tag} (change…)",
+            command=lambda: self.set_image_tag(hit),
         )
         menu.add_separator()
         menu.add_command(
@@ -1394,7 +1493,7 @@ class PosterCanvas(tk.Canvas):
             state="normal" if idx > 0 else "disabled",
         )
         try:
-            menu.tk_popup(event.x_root, event.y_root)
+            menu.tk_popup(x_root, y_root)
         finally:
             menu.grab_release()
 
@@ -1487,48 +1586,91 @@ class PosterCanvas(tk.Canvas):
     ) -> bool:
         """Position the images not moved by hand so they sit on the page without overlap.
 
-        With resize=True they are also scaled to fill the page; with resize=False they keep
-        their current size and are placed in wrapped rows (which may run off the page).
+        Images moved by hand are obstacles: arranged images avoid them. With resize=True the
+        images are also scaled to fill the page; with resize=False they keep their size and are
+        placed in wrapped rows (which may run off the page). After the call,
+        last_arrange_unplaced counts images that could not be placed clear of the others.
         """
-        # Images the user has dragged keep their place and size.
-        images = [layer for layer in self.layers if isinstance(layer, ImageLayer) and not layer.user_placed]
-        if not images:
+        self.last_arrange_unplaced = 0
+        movable = [layer for layer in self.layers if isinstance(layer, ImageLayer) and not layer.user_placed]
+        fixed = [layer for layer in self.layers if isinstance(layer, ImageLayer) and layer.user_placed]
+        if not movable:
             return False
+        obstacles = [
+            (
+                layer.x - max(0, layer.border_width),
+                layer.y - max(0, layer.border_width),
+                layer.width + 2 * max(0, layer.border_width),
+                layer.height + 2 * max(0, layer.border_width),
+            )
+            for layer in fixed
+        ]
+        # Each item: planned footprint (image plus border) and whether it may shrink.
+        items: list[dict[str, object]] = []
+        plan: list[tuple[ImageLayer, float, float, float]] = []  # (layer, bw, img_w, img_h)
         if not resize:
             sizes = [
                 (layer.width + 2 * max(0, layer.border_width), layer.height + 2 * max(0, layer.border_width))
-                for layer in images
+                for layer in movable
             ]
             positions, _fits = compute_shelf_layout(sizes, self.page_width, self.page_height, margin, gap)
-            self.push_undo_checkpoint()
-            for layer, (x, y) in zip(images, positions):
+            for layer, (px, py), (sw, sh) in zip(movable, positions, sizes):
                 bw = max(0, layer.border_width)
-                layer.x = x + bw
-                layer.y = y + bw
-            self._on_selection_change(self.selected_layer())
-            self.redraw()
-            return True
-        aspects = [layer.source.width / max(1, layer.source.height) for layer in images]
-        weights = [layer.resize_percent for layer in images]
-        rects = compute_arrangement(aspects, self.page_width, self.page_height, margin, gap, weights)
-        if not rects:
-            return False
+                items.append({"x0": px, "y0": py, "fw": sw, "fh": sh, "shrinkable": False})
+                plan.append((layer, bw, layer.width, layer.height))
+        else:
+            aspects = [layer.source.width / max(1, layer.source.height) for layer in movable]
+            weights = [
+                _collage_size(layer)[0] * _collage_size(layer)[1] * layer.resize_percent / 100
+                for layer in movable
+            ]
+            layout_gap = gap
+            rects = compute_arrangement(aspects, self.page_width, self.page_height, margin, layout_gap, weights)
+            while not rects and layout_gap > 0:
+                # The gap leaves no room for this many images; halve it until they fit.
+                layout_gap //= 2
+                rects = compute_arrangement(aspects, self.page_width, self.page_height, margin, layout_gap, weights)
+            if not rects:
+                return False
+            for layer, aspect, (x, y, w, h) in zip(movable, aspects, rects):
+                # The border is drawn outside the bbox, so fit the image inside the cell
+                # minus the border on each side, keeping the source aspect ratio.
+                bw = max(0, layer.border_width)
+                # A cell too small for the border would push the image and its border into the
+                # next cell, so the border is reduced just enough to fit.
+                fit_bw = int(max(0, (min(w, h) - 2) // 2))
+                bw = min(bw, fit_bw)
+                inner_w = max(0.01, w - 2 * bw)
+                inner_h = max(0.01, h - 2 * bw)
+                img_w = min(inner_w, inner_h * aspect)
+                img_h = img_w / aspect
+                cell_x = x + bw + (inner_w - img_w) / 2
+                cell_y = y + bw + (inner_h - img_h) / 2
+                items.append(
+                    {
+                        "x0": cell_x - bw,
+                        "y0": cell_y - bw,
+                        "fw": img_w + 2 * bw,
+                        "fh": img_h + 2 * bw,
+                        "shrinkable": True,
+                    }
+                )
+                plan.append((layer, bw, img_w, img_h))
+
+        boxes, unplaced = place_avoiding(items, obstacles, self.page_width, self.page_height)
+        self.last_arrange_unplaced = unplaced
 
         self.push_undo_checkpoint()
-        for layer, aspect, (x, y, w, h) in zip(images, aspects, rects):
-            # The border is drawn outside the bbox, so fit the image inside the cell
-            # minus the border on each side, keeping the source aspect ratio.
-            bw = max(0, layer.border_width)
-            inner_w = max(MIN_LAYER_SIZE, w - 2 * bw)
-            inner_h = max(MIN_LAYER_SIZE, h - 2 * bw)
-            img_w = min(inner_w, inner_h * aspect)
-            img_h = img_w / aspect
-            flatten_source_rect(layer)
-            layer.width = img_w
-            layer.height = img_h
-            layer.x = x + bw + (inner_w - img_w) / 2
-            layer.y = y + bw + (inner_h - img_h) / 2
-
+        for (layer, bw, img_w, img_h), item, (bx, by, box_w, box_h) in zip(plan, items, boxes):
+            # The box keeps its planned border. A shrunk box shrinks the picture by the same factor.
+            scale = box_w / float(item["fw"])  # type: ignore[arg-type]
+            if resize:
+                layer.border_width = int(bw)
+                flatten_source_rect(layer)
+                layer.width = max(0.01, img_w * scale)
+                layer.height = max(0.01, img_h * scale)
+            layer.x = bx + bw
+            layer.y = by + bw
         self._on_selection_change(self.selected_layer())
         self.redraw()
         return True
@@ -1737,6 +1879,87 @@ class PosterCanvas(tk.Canvas):
         self.redraw()
         return True
 
+    def mask_targets(self) -> tuple[list[MaskLayer], list[ImageLayer]]:
+        """The masks and images the Mask tab acts on: selected masks, the masks on selected
+        images, and the selected images themselves."""
+        masks: list[MaskLayer] = []
+        images: list[ImageLayer] = []
+        seen: set[str] = set()
+        for layer in self.selected_layers():
+            if isinstance(layer, MaskLayer) and layer.id not in seen:
+                masks.append(layer)
+                seen.add(layer.id)
+            elif isinstance(layer, ImageLayer):
+                images.append(layer)
+        for image in images:
+            for mask in self.masks_for(image.id):
+                if mask.id not in seen:
+                    masks.append(mask)
+                    seen.add(mask.id)
+        return masks, images
+
+    def set_mask_properties(
+        self,
+        *,
+        shape: Optional[MaskShape] = None,
+        corner_radius: Optional[int] = None,
+        sides: Optional[tuple[EdgeSide, ...]] = None,
+        flipped: Optional[bool] = None,
+        peaks: Optional[int] = None,
+        amplitude: Optional[int] = None,
+        create_for_images: bool = False,
+        undo: bool = True,
+    ) -> tuple[int, int, int]:
+        """Give every target mask the same properties. With create_for_images, selected images
+        without a mask get a new one covering them. Returns (created, updated, skipped), where
+        skipped counts images left alone because they already have an applied mask."""
+
+        def values() -> dict[str, object]:
+            wanted: dict[str, object] = {
+                "shape": shape,
+                "corner_radius": corner_radius,
+                "sides": sides,
+                "flipped": flipped,
+                "peaks": peaks,
+                "amplitude": amplitude,
+            }
+            return {key: value for key, value in wanted.items() if value is not None}
+
+        wanted = values()
+        masks, images = self.mask_targets()
+        changed = [mask for mask in masks if any(getattr(mask, key) != value for key, value in wanted.items())]
+        new_for: list[ImageLayer] = []
+        skipped = 0
+        if create_for_images:
+            for image in images:
+                if self.masks_for(image.id):
+                    continue
+                if image.applied_mask is not None:
+                    skipped += 1
+                else:
+                    new_for.append(image)
+        if not changed and not new_for:
+            return 0, 0, skipped
+        if undo:
+            self.push_undo_checkpoint()
+        for mask in changed:
+            for key, value in wanted.items():
+                setattr(mask, key, value)
+        for image in new_for:
+            mask = MaskLayer(
+                target_id=image.id,
+                x=image.x,
+                y=image.y,
+                width=image.width,
+                height=image.height,
+                positioned=True,
+            )
+            for key, value in wanted.items():
+                setattr(mask, key, value)
+            self.layers.append(mask)
+        self.redraw()
+        return len(new_for), len(changed), skipped
+
     def add_mask_for_image(self, image: ImageLayer, shape: MaskShape = "circle") -> Optional[MaskLayer]:
         """Create a mask covering the image (or select its existing mask) and select it.
 
@@ -1936,6 +2159,7 @@ class PosterCanvas(tk.Canvas):
         placement_index: int = 0,
         report_errors: bool = True,
         record_undo: bool = True,
+        tag: str = "",
     ) -> bool:
         """Load an image file and place it on the board. Return True on success."""
         if not is_image_path(path):
@@ -1962,22 +2186,40 @@ class PosterCanvas(tk.Canvas):
             y=(self.page_height - h) / 2 + stagger,
             width=w,
             height=h,
+            tag=normalize_tag(tag),
         )
         self.add_layer(layer, record_undo=record_undo)
         return True
 
-    def add_images_from_files(self, paths: list[Path]) -> None:
+    def set_image_tag(self, image: ImageLayer) -> None:
+        """Ask for the tag the AI chat uses to refer to this image. Empty clears it."""
+        answer = simpledialog.askstring(
+            "AI tag",
+            "Tag for this image (use @tag in the AI chat):",
+            initialvalue=image.tag,
+            parent=self,
+        )
+        if answer is None:
+            return
+        tag = normalize_tag(answer)
+        if tag == image.tag:
+            return
+        self.push_undo_checkpoint()
+        image.tag = tag
+
+    def add_images_from_files(self, paths: list[Path], tags: Optional[list[str]] = None) -> None:
         """Import several image files; stagger placement so they do not fully overlap."""
         failed: list[str] = []
         placed = 0
         if paths:
             self.push_undo_checkpoint()
-        for path in paths:
+        for index, path in enumerate(paths):
             if self.add_image_from_file(
                 path,
                 placement_index=placed,
                 report_errors=False,
                 record_undo=False,
+                tag=tags[index] if tags and index < len(tags) else "",
             ):
                 placed += 1
             else:
@@ -2075,8 +2317,19 @@ class PosterCanvas(tk.Canvas):
             )
         return 0.0, 0.0, 0.0, 0.0
 
+    def _mask_hidden(self, layer: BoardLayer) -> bool:
+        """True for a mask whose outline is hidden (View > Show masks off). A selected mask always shows."""
+        return isinstance(layer, MaskLayer) and not self.show_masks and layer.id not in self.selected_ids
+
+    def set_show_masks(self, show: bool) -> None:
+        """Show or hide mask outlines on the board. Masks keep clipping their images either way."""
+        self.show_masks = show
+        self.redraw()
+
     def _hit_test(self, px: float, py: float) -> Optional[BoardLayer]:
         for layer in reversed(self.layers):
+            if self._mask_hidden(layer):
+                continue  # hidden masks are click-through
             x1, y1, x2, y2 = self._layer_bbox(layer)
             if x1 <= px <= x2 and y1 <= py <= y2:
                 if isinstance(layer, LineLayer):
@@ -2368,7 +2621,7 @@ class PosterCanvas(tk.Canvas):
         hits = [
             layer.id
             for layer in self.layers
-            if self._boxes_overlap(self._layer_bbox(layer), (x1, y1, x2, y2))
+            if not self._mask_hidden(layer) and self._boxes_overlap(self._layer_bbox(layer), (x1, y1, x2, y2))
         ]
         self.set_selection([*base, *hits])
 
@@ -2639,7 +2892,7 @@ class PosterCanvas(tk.Canvas):
 
         # Masks are editor-only outlines; they are never drawn into the exported image.
         for mask in self.layers:
-            if isinstance(mask, MaskLayer) and mask.id not in self.selected_ids:
+            if isinstance(mask, MaskLayer) and mask.id not in self.selected_ids and self.show_masks:
                 mx1, my1 = self.page_to_canvas(mask.x, mask.y)
                 mx2, my2 = self.page_to_canvas(mask.x + mask.width, mask.y + mask.height)
                 self.create_rectangle(mx1, my1, mx2, my2, outline=MASK_OUTLINE_COLOR, width=1, dash=(2, 4), tags="overlay")
@@ -2984,16 +3237,31 @@ def openai_list_image_models(api_key: str) -> list[str]:
     return models
 
 
-def openai_edit_image(api_key: str, model: str, prompt: str, image: Image.Image) -> Image.Image:
-    """Send image + prompt to the OpenAI image-edit endpoint and return the generated image.
-
-    Raises RuntimeError with a readable message on any failure.
-    """
+def _png_bytes(image: Image.Image) -> bytes:
     src = image.convert("RGBA")
     if max(src.size) > AI_MAX_INPUT_SIDE:
         src.thumbnail((AI_MAX_INPUT_SIDE, AI_MAX_INPUT_SIDE), Image.LANCZOS)
     buf = io.BytesIO()
     src.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def openai_edit_image(
+    api_key: str,
+    model: str,
+    prompt: str,
+    image: Image.Image,
+    references: Optional[list[Image.Image]] = None,
+) -> Image.Image:
+    """Send image + prompt to the OpenAI image-edit endpoint and return the generated image.
+
+    references are extra images the prompt can point to; the first image is the one edited.
+    Raises RuntimeError with a readable message on any failure.
+    """
+    pngs = [_png_bytes(image)] + [_png_bytes(ref) for ref in references or []]
+    if len(pngs) > 1 and not model.startswith("gpt-image"):
+        raise RuntimeError(f"{model} accepts only one image, so @tag references need a gpt-image model.")
+    field_name = "image[]" if len(pngs) > 1 else "image"
 
     boundary = uuid.uuid4().hex
     parts: list[bytes] = []
@@ -3001,14 +3269,15 @@ def openai_edit_image(api_key: str, model: str, prompt: str, image: Image.Image)
         parts.append(
             f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode("utf-8"),
         )
-    parts.append(
-        (
-            f'--{boundary}\r\nContent-Disposition: form-data; name="image"; filename="image.png"\r\n'
-            "Content-Type: image/png\r\n\r\n"
-        ).encode("utf-8")
-        + buf.getvalue()
-        + b"\r\n",
-    )
+    for number, png in enumerate(pngs, start=1):
+        parts.append(
+            (
+                f'--{boundary}\r\nContent-Disposition: form-data; name="{field_name}"; filename="image{number}.png"\r\n'
+                "Content-Type: image/png\r\n\r\n"
+            ).encode("utf-8")
+            + png
+            + b"\r\n",
+        )
     parts.append(f"--{boundary}--\r\n".encode("utf-8"))
     request = urllib.request.Request(
         OPENAI_EDIT_URL,
@@ -3101,6 +3370,8 @@ class AIChatPane(ttk.Frame):
 
         self._target_label = ttk.Label(self._body, text="Target: none", style="Hint.TLabel")
         self._target_label.pack(anchor="w", pady=(6, 2))
+        self._tags_label = ttk.Label(self._body, text="", style="Hint.TLabel", wraplength=220)
+        self._tags_label.pack(anchor="w", pady=(0, 2))
 
         log_frame = ttk.Frame(self._body)
         log_frame.pack(fill=tk.BOTH, expand=True)
@@ -3122,6 +3393,7 @@ class AIChatPane(ttk.Frame):
         self._prompt = tk.Text(self._body, height=3, width=28, wrap=tk.WORD, borderwidth=1, relief=tk.SOLID)
         self._prompt.pack(fill=tk.X, pady=(6, 0))
         self._prompt.bind("<Return>", self._on_return)
+        self._prompt.bind("<FocusIn>", lambda _e: self.refresh_tags())
         self._send_btn = ttk.Button(self._body, text="Generate & replace", command=self.send)
         self._send_btn.pack(fill=tk.X, pady=(4, 0))
         ttk.Label(self._body, textvariable=self._status_var, style="Hint.TLabel", wraplength=220).pack(
@@ -3155,7 +3427,25 @@ class AIChatPane(ttk.Frame):
         name = layer.source_path.name if layer.source_path else "image"
         self._target_label.configure(text=f"Target: {name} ({int(layer.width)}×{int(layer.height)})")
         self.set_open(True)
+        self.refresh_tags()
         self._prompt.focus_set()
+
+    def _tagged_images(self) -> dict[str, list[ImageLayer]]:
+        """Tagged images on the board other than the target, keyed by lower-cased tag."""
+        found: dict[str, list[ImageLayer]] = {}
+        for layer in self._get_canvas().layers:
+            if isinstance(layer, ImageLayer) and layer.tag and layer.id != self._target_id:
+                found.setdefault(layer.tag.lower(), []).append(layer)
+        return found
+
+    def refresh_tags(self) -> None:
+        """Show which @tags the prompt can use."""
+        tags = sorted({layers[0].tag for layers in self._tagged_images().values()}, key=str.lower)
+        if tags:
+            text = "Reference images: " + " ".join(f"@{t}" for t in tags)
+        else:
+            text = "Tip: tag images on import or right-click > Set AI tag…, then write @tag in your prompt."
+        self._tags_label.configure(text=text)
 
     def _append(self, text: str) -> None:
         self._log.configure(state=tk.NORMAL)
@@ -3190,6 +3480,14 @@ class AIChatPane(ttk.Frame):
         if not prompt:
             return
         model = self._model_var.get().strip() or AI_DEFAULT_MODEL
+        available = self._tagged_images()
+        own_tag = layer.tag.lower()
+        mentioned = [t for t in find_tag_mentions(prompt) if t != own_tag]
+        unknown = [t for t in mentioned if t not in available]
+        if unknown:
+            self._status_var.set("No image tagged " + ", ".join(f"@{t}" for t in unknown) + ".")
+            return
+        ref_layers = [available[t][0] for t in mentioned]
         update_settings(
             openai_api_key=key if self._remember_var.get() else "",
             openai_image_model=model,
@@ -3201,10 +3499,16 @@ class AIChatPane(ttk.Frame):
         self._status_var.set("Generating… this can take a minute.")
         source = layer.source.copy()
         layer_id = layer.id
+        references = [ref.source.copy() for ref in ref_layers]
+        if references:
+            # Tell the model which attached image each @tag means.
+            notes = ["Image 1 is the image to edit."]
+            notes += [f'Image {i} is "{ref.tag}".' for i, ref in enumerate(ref_layers, start=2)]
+            prompt = prompt + "\n\n" + " ".join(notes)
 
         def work() -> None:
             try:
-                self._results.put(("ok", (layer_id, openai_edit_image(key, model, prompt, source))))
+                self._results.put(("ok", (layer_id, openai_edit_image(key, model, prompt, source, references))))
             except Exception as exc:  # shown to the user
                 self._results.put(("err", str(exc)))
 
@@ -3463,6 +3767,7 @@ class ManifestationBoardApp(tk.Tk):
         self.geometry("1280x800")
         self._updating_props = False
         self._dark_mode = tk.BooleanVar(value=bool(load_settings().get("dark_mode", False)))
+        self._show_masks_var = tk.BooleanVar(value=bool(load_settings().get("show_masks", True)))
         self._keep_aspect_resize = tk.BooleanVar(value=bool(load_settings().get("keep_aspect_on_resize", True)))
         self._build_layout()
         self.canvas.keep_aspect_on_resize = self._keep_aspect_resize.get()
@@ -3471,11 +3776,16 @@ class ManifestationBoardApp(tk.Tk):
         self._project_path: Optional[Path] = None
         self._saved_marker: Optional[tuple[int, int, int]] = None
         self.after_idle(self._mark_saved)
+        self.after(250, self._sync_image_list)
         self.protocol("WM_DELETE_WINDOW", self._exit_app)
         self.bind_all("<Control-o>", lambda _e: self._project_open())
         self.bind_all("<Control-s>", lambda _e: self._project_save())
         self.bind_all("<Control-Shift-S>", lambda _e: self._project_save_as())
         self._apply_theme()
+
+    def _on_show_masks_toggled(self) -> None:
+        self.canvas.set_show_masks(self._show_masks_var.get())
+        update_settings(show_masks=self._show_masks_var.get())
 
     def _on_keep_aspect_resize_toggled(self) -> None:
         self.canvas.keep_aspect_on_resize = self._keep_aspect_resize.get()
@@ -3589,6 +3899,12 @@ class ManifestationBoardApp(tk.Tk):
 
         view_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="View", menu=view_menu)
+        view_menu.add_checkbutton(
+            label="Show mask outlines",
+            variable=self._show_masks_var,
+            command=self._on_show_masks_toggled,
+        )
+        view_menu.add_separator()
         view_menu.add_command(label="Zoom to fit", command=self._zoom_fit)
         view_menu.add_command(label="Zoom in", command=lambda: self._zoom_by(1.15))
         view_menu.add_command(label="Zoom out", command=lambda: self._zoom_by(1 / 1.15))
@@ -3772,6 +4088,33 @@ class ManifestationBoardApp(tk.Tk):
         resize_panel = ResizePanel(left, get_canvas=lambda: self.canvas)
         self._resize_panel = resize_panel
         resize_panel.pack(fill=tk.X, pady=(0, 8))
+
+        image_box = ttk.LabelFrame(left, text="Images on board", padding=6)
+        image_box.pack(fill=tk.X, pady=(0, 8))
+        list_frame = ttk.Frame(image_box)
+        list_frame.pack(fill=tk.X, expand=True)
+        image_scroll = ttk.Scrollbar(list_frame)
+        image_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        palette = self._current_palette()
+        self._image_list = tk.Listbox(
+            list_frame,
+            height=6,
+            exportselection=False,
+            selectmode=tk.EXTENDED,
+            yscrollcommand=image_scroll.set,
+            background=palette["field"],
+            foreground=palette["fg"],
+            selectbackground=palette["select"],
+            selectforeground=palette["select_fg"],
+            highlightthickness=0,
+        )
+        self._image_list.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        image_scroll.config(command=self._image_list.yview)
+        self._image_list.bind("<<ListboxSelect>>", self._on_image_list_select)
+        self._image_list.bind("<Button-3>", self._on_image_list_menu)
+        self._image_list_ids: list[str] = []
+        self._image_list_sig: Optional[tuple[tuple[str, str], ...]] = None
+        self._image_list_guard = False
 
         center = ttk.Frame(body)
         body.add(center, weight=1)
@@ -4088,6 +4431,12 @@ class ManifestationBoardApp(tk.Tk):
         ttk.Label(edge_frame, text="0 = default", style="Hint.TLabel").grid(
             row=5, column=0, columnspan=2, sticky="w", padx=4
         )
+        ttk.Checkbutton(
+            mask_tab,
+            text="Show mask outlines on board",
+            variable=self._show_masks_var,
+            command=self._on_show_masks_toggled,
+        ).pack(anchor="w", pady=(10, 0))
         self._apply_mask_btn = ttk.Button(mask_tab, text="Apply mask", command=self._apply_mask)
         self._apply_mask_btn.pack(fill=tk.X, pady=(14, 0))
         self._cancel_mask_btn = ttk.Button(mask_tab, text="Cancel mask edit", command=self._cancel_mask_edit)
@@ -4350,6 +4699,13 @@ class ManifestationBoardApp(tk.Tk):
             )
             dialog.destroy()
             self.canvas.arrange_images(margin=margin, gap=layout_gap, resize=resize)
+            unplaced = self.canvas.last_arrange_unplaced
+            if unplaced:
+                messagebox.showinfo(
+                    "Arrange images",
+                    f"{unplaced} image(s) could not be placed without overlapping. They were left where they were planned; "
+                    "move a moved image, shrink the margin or gap, or turn on resize to fill the page.",
+                )
 
         buttons = ttk.Frame(frame)
         buttons.grid(row=6, column=0, columnspan=2, sticky="e", pady=(12, 0))
@@ -4846,6 +5202,7 @@ class ManifestationBoardApp(tk.Tk):
             self._mask_info_var.set("Select a mask on the board.")
             self._apply_mask_btn.state(["disabled"])
         self._update_edge_controls()
+        self._update_apply_button()
         self._refresh_mask_cancel_button()
         self._updating_props = False
         self._refresh_stroke_ui()
@@ -4878,13 +5235,16 @@ class ManifestationBoardApp(tk.Tk):
         self._props_notebook.select(self._mask_tab)
 
     def _on_mask_shape_picked(self) -> None:
-        """Handle a click on a shape button: add a mask to the selected image, or restyle the selected mask."""
+        """A shape button: a single image gets a mask as before; several images or masks all get it."""
         shape = self._mask_shape_var.get()
         if shape not in MASK_SHAPE_LABELS:
             return
-        layer = self.canvas.selected_layer()
-        if isinstance(layer, ImageLayer):
-            mask = self.canvas.add_mask_for_image(layer, shape)
+        masks, images = self.canvas.mask_targets()
+        if not masks and not images:
+            messagebox.showinfo("Mask", "Select an image or a mask on the board first.")
+            return
+        if len(images) == 1 and not masks:
+            mask = self.canvas.add_mask_for_image(images[0], shape)
             if mask is None:
                 messagebox.showinfo(
                     "Mask",
@@ -4895,26 +5255,33 @@ class ManifestationBoardApp(tk.Tk):
                 self.canvas.push_undo_checkpoint()
                 mask.shape = shape
                 self.canvas.redraw()
-            self._update_edge_controls()
-            return
-        if isinstance(layer, MaskLayer):
-            self._on_mask_style_changed()
-            return
-        messagebox.showinfo("Mask", "Select an image on the board first.")
+        else:
+            _created, _updated, skipped = self.canvas.set_mask_properties(shape=shape, create_for_images=True)
+            if skipped:
+                messagebox.showinfo(
+                    "Mask",
+                    f"{skipped} image(s) already have an applied mask and were skipped. "
+                    "Use Edit applied mask on them to change them.",
+                )
+        self._update_edge_controls()
+        self._update_apply_button()
 
     def _update_edge_controls(self) -> None:
-        """Enable the Edge side group only while an edge shape mask is selected."""
-        layer = self.canvas.selected_layer()
-        usable = isinstance(layer, MaskLayer) and layer.shape in EDGE_SHAPES
+        """Enable the Edge side group while an edge-shape mask is among the targets."""
+        masks, _images = self.canvas.mask_targets()
+        usable = any(mask.shape in EDGE_SHAPES for mask in masks)
         for widget in self._edge_widgets:
             widget.state(["!disabled"] if usable else ["disabled"])
 
+    def _update_apply_button(self) -> None:
+        """Apply mask is enabled when a target mask is positioned over its image."""
+        masks, _images = self.canvas.mask_targets()
+        ready = any(mask.positioned for mask in masks)
+        self._apply_mask_btn.state(["!disabled"] if ready else ["disabled"])
+
     def _on_edge_option_changed(self) -> None:
-        """Apply the chosen sides or flip to the selected edge mask."""
+        """Apply the chosen sides or flip to every target mask that is an edge shape."""
         if self._updating_props:
-            return
-        layer = self.canvas.selected_layer()
-        if not isinstance(layer, MaskLayer) or layer.shape not in EDGE_SHAPES:
             return
         sides = tuple(key for key in EDGE_SIDE_LABELS if self._mask_side_vars[key].get())
         flipped = bool(self._mask_flip_var.get())
@@ -4923,47 +5290,41 @@ class ManifestationBoardApp(tk.Tk):
             amplitude = max(0, int(float(self._mask_amp_var.get() or 0)))
         except ValueError:
             return
-        if (layer.sides, layer.flipped, layer.peaks, layer.amplitude) == (sides, flipped, peaks, amplitude):
+        masks, _images = self.canvas.mask_targets()
+        if not any(mask.shape in EDGE_SHAPES for mask in masks):
             return
-        self.canvas.push_undo_checkpoint()
-        layer.sides = sides
-        layer.flipped = flipped
-        layer.peaks = peaks
-        layer.amplitude = amplitude
-        self.canvas.redraw()
+        self.canvas.set_mask_properties(
+            sides=sides,
+            flipped=flipped,
+            peaks=peaks,
+            amplitude=amplitude,
+        )
 
     def _on_mask_style_changed(self) -> None:
-        """Apply shape or radius changes from the Mask tab to the selected mask."""
+        """Corner radius from the Mask tab, applied to every target mask."""
         if self._updating_props:
-            return
-        layer = self.canvas.selected_layer()
-        if not isinstance(layer, MaskLayer):
-            return
-        shape = self._mask_shape_var.get()
-        if shape not in MASK_SHAPE_LABELS:
             return
         try:
             radius = max(0, int(self._mask_radius_var.get()))
         except (ValueError, tk.TclError):
             return
-        if layer.shape == shape and layer.corner_radius == radius:
+        masks, _images = self.canvas.mask_targets()
+        if not masks:
             return
         # One undo step per editing session; a new step starts after any other history change.
-        if self._mask_style_version != self.canvas.history_version:
-            self.canvas.push_undo_checkpoint()
-            self._mask_style_version = self.canvas.history_version
-        layer.shape = shape
-        layer.corner_radius = radius
-        self.canvas.redraw()
+        undo = self._mask_style_version != self.canvas.history_version
+        self.canvas.set_mask_properties(corner_radius=radius, undo=undo)
+        self._mask_style_version = self.canvas.history_version
         self._update_edge_controls()
 
     def _apply_mask(self) -> None:
-        """Bake the selected mask into its image."""
-        layer = self.canvas.selected_layer()
-        if not isinstance(layer, MaskLayer):
-            messagebox.showinfo("Apply mask", "Select a mask on the board first.")
+        """Bake every target mask into its image."""
+        masks, _images = self.canvas.mask_targets()
+        if not masks:
+            messagebox.showinfo("Apply mask", "Select a mask or an image with a mask on the board first.")
             return
-        if not self.canvas.apply_mask(layer.id):
+        applied = sum(1 for mask in masks if self.canvas.apply_mask(mask.id))
+        if applied == 0:
             messagebox.showinfo(
                 "Apply mask",
                 "The mask doesn't overlap its image. Drag it over the part of the image to keep.",
@@ -5438,6 +5799,70 @@ class ManifestationBoardApp(tk.Tk):
         self._refresh_page_info()
         self._set_project_path(path)
         self._mark_saved()
+
+    def _image_list_entries(self) -> list[tuple[str, str]]:
+        """(layer id, label) for every image on the board, in order."""
+        images = [layer for layer in self.canvas.layers if isinstance(layer, ImageLayer)]
+        entries: list[tuple[str, str]] = []
+        for number, layer in enumerate(images, start=1):
+            name = layer.source_path.name if layer.source_path else f"Image {number}"
+            tags: list[str] = []
+            if layer.applied_mask is not None or self.canvas.masks_for(layer.id):
+                tags.append("masked")
+            if layer.border_width > 0:
+                tags.append("stroke")
+            label = f"{number}. {name}" + (f"  [{', '.join(tags)}]" if tags else "")
+            entries.append((layer.id, label))
+        return entries
+
+    def _sync_image_list(self) -> None:
+        """Keep the Images on board list in step with the board and the selection."""
+        entries = self._image_list_entries()
+        signature = tuple(entries)
+        if signature != self._image_list_sig:
+            self._image_list_sig = signature
+            self._image_list_ids = [layer_id for layer_id, _ in entries]
+            self._image_list_guard = True
+            try:
+                self._image_list.delete(0, tk.END)
+                for _, label in entries:
+                    self._image_list.insert(tk.END, label)
+            finally:
+                self._image_list_guard = False
+        selected = set(self.canvas.selected_ids)
+        wanted = [index for index, layer_id in enumerate(self._image_list_ids) if layer_id in selected]
+        if wanted != list(self._image_list.curselection()):
+            self._image_list_guard = True
+            try:
+                self._image_list.selection_clear(0, tk.END)
+                for index in wanted:
+                    self._image_list.selection_set(index)
+            finally:
+                self._image_list_guard = False
+        self.after(250, self._sync_image_list)
+
+    def _on_image_list_select(self, _event: Optional[tk.Event] = None) -> None:
+        if self._image_list_guard:
+            return
+        ids = [
+            self._image_list_ids[index]
+            for index in self._image_list.curselection()
+            if index < len(self._image_list_ids)
+        ]
+        self.canvas.set_selection(ids)
+
+    def _on_image_list_menu(self, event: tk.Event) -> None:
+        """Right-click a row to open that image's context menu."""
+        index = self._image_list.nearest(event.y)
+        if index < 0 or index >= len(self._image_list_ids):
+            return
+        layer_id = self._image_list_ids[index]
+        layer = self.canvas.get_layer(layer_id)
+        if not isinstance(layer, ImageLayer):
+            return
+        if layer_id not in self.canvas.selected_ids:
+            self.canvas.set_selection([layer_id])
+        self.canvas.show_image_menu(layer, event.x_root, event.y_root)
 
     def _refresh_mask_cancel_button(self) -> None:
         active = self.canvas.mask_session is not None
