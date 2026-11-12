@@ -1593,9 +1593,11 @@ class PosterCanvas(tk.Canvas):
             # Keep the image's current position and size. Only the mask goes: the unmasked pixels
             # are cut from the pre-mask image over the area the mask covered, then shown in the
             # current box.
+            # Where the full pre-mask pixels sit: the collage's restore_rect, or the pre-mask box.
+            full_rect = prior.restore_rect or (prior.base_x, prior.base_y, prior.base_w, prior.base_h)
             image.source = _unmasked_pixels(
                 prior.base_source,
-                (prior.base_x, prior.base_y, prior.base_w, prior.base_h),
+                full_rect,
                 (prior.applied_x, prior.applied_y, prior.applied_w, prior.applied_h),
             )
             image.source_rect = None
